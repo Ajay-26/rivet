@@ -1,6 +1,6 @@
-use rivet_core::{RivetError, Task, TaskId, TaskResult, WorkerInfo};
 use crate::{Scheduler, TaskAssignment};
-
+use rivet_core::{RivetError, Task, TaskId, TaskResult, WorkerInfo};
+use std::collections::VecDeque;
 /// A single-process scheduler — all state lives in memory, no networking.
 ///
 /// This is the first implementation you will write. Start here for Milestone 1.
@@ -19,10 +19,8 @@ use crate::{Scheduler, TaskAssignment};
 ///   - What's the difference between `HashMap` and `BTreeMap`?
 #[derive(Debug)]
 pub struct LocalScheduler {
-    // TODO: Add your fields here.
-    //
+    pending: std::collections::VecDeque<Task>,
     // Example to get started:
-    //   pending: std::collections::VecDeque<Task>,
     //   workers: std::collections::HashMap<WorkerId, WorkerInfo>,
     //   assigned: std::collections::HashMap<TaskId, WorkerId>,
 }
@@ -30,7 +28,7 @@ pub struct LocalScheduler {
 impl LocalScheduler {
     pub fn new() -> Self {
         LocalScheduler {
-            // TODO: Initialise your fields.
+            pending: VecDeque::new(),
         }
     }
 }
@@ -43,10 +41,8 @@ impl Default for LocalScheduler {
 
 impl Scheduler for LocalScheduler {
     fn submit(&mut self, _task: Task) -> TaskId {
-        // TODO (Milestone 1):
-        //   1. Store the task in your pending queue.
-        //   2. Return `task.id`.
-        todo!("store the task and return its ID")
+        self.pending.push_back(_task);
+        return self.pending.back().unwrap().id;
     }
 
     fn schedule(&mut self) -> Vec<TaskAssignment> {
