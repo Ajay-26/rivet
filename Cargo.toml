@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "crates/rivet-core",
+    "crates/rivet-scheduler",
+    "crates/rivet-worker",
+    "crates/rivet-client",
+]
+resolver = "2"
+
+[workspace.lints.rust]
+unused_imports = "warn"
+dead_code = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = "warn"

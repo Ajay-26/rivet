@@ -1,0 +1,11 @@
+[package]
+name = "rivet-scheduler"
+version = "0.1.0"
+edition = "2021"
+description = "Task scheduling interface and placeholder implementation for Rivet"
+
+[dependencies]
+rivet-core = { path = "../rivet-core" }
+
+[lints]
+workspace = true

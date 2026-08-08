@@ -1,0 +1,11 @@
+[package]
+name = "rivet-worker"
+version = "0.1.0"
+edition = "2021"
+description = "Worker interface and placeholder implementation for Rivet"
+
+[dependencies]
+rivet-core = { path = "../rivet-core" }
+
+[lints]
+workspace = true

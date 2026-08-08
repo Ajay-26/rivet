@@ -1,0 +1,17 @@
+[package]
+name = "rivet-client"
+version = "0.1.0"
+edition = "2021"
+description = "Client API and CLI for the Rivet distributed task framework"
+
+[[bin]]
+name = "rivet"
+path = "src/bin/rivet.rs"
+
+[dependencies]
+rivet-core      = { path = "../rivet-core" }
+rivet-scheduler = { path = "../rivet-scheduler" }
+rivet-worker    = { path = "../rivet-worker" }
+
+[lints]
+workspace = true
