@@ -1,5 +1,5 @@
 use crate::{Scheduler, TaskAssignment};
-use rivet_core::{RivetError, Task, TaskId, TaskResult, WorkerId, WorkerInfo};
+use rivet_core::{RivetError, Task, TaskId, TaskResult, WorkerId, WorkerInfo, WorkerStatus};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 /// A single-process scheduler — all state lives in memory, no networking.
@@ -22,22 +22,24 @@ use std::collections::VecDeque;
 pub struct LocalScheduler {
     pending: std::collections::VecDeque<Task>,
     workers: std::collections::HashMap<WorkerId, WorkerInfo>,
-    // Example to get started:
-    //   assigned: std::collections::HashMap<TaskId, WorkerId>,
+    assigned: std::collections::HashMap<TaskId, WorkerId>,
+    results: std::collections::HashMap<TaskId, TaskResult>
 }
 
 impl LocalScheduler {
     pub fn new() -> Self {
-        LocalScheduler {
-            pending: VecDeque::new(),
-            workers: HashMap::new(),
-        }
+        return LocalScheduler {
+            pending: std::collections::VecDeque::new(), 
+            workers: std::collections::HashMap::new(), 
+            assigned: std::collections::HashMap::new(),
+            results: std::collections::HashMap::new()
+        };
     }
 }
 
 impl Default for LocalScheduler {
     fn default() -> Self {
-        Self::new()
+        return Self::new();
     }
 }
 
@@ -69,11 +71,26 @@ impl Scheduler for LocalScheduler {
 
     fn worker_finished(&mut self, _result: TaskResult) -> Result<(), RivetError> {
         // TODO (Milestone 1):
+
+
         //   Look up which task just finished (use `result.task_id()`).
+        let task_id: TaskId = _result.task_id();
+
         //   Find which worker was running it.
-        //   Mark that worker Idle again.
-        //   Store the result somewhere the client can retrieve it.
-        //   Return Err(RivetError::TaskNotFound(...)) if the task ID is unknown.
-        todo!("update task and worker state from the result")
+        let worker_id: Option<&WorkerId> = self.assigned.get(&task_id);
+        
+        if let worker = self.workers.get_mut(worker_id.unwrap()).unwrap() {
+            
+            //   Mark that worker Idle again.
+            worker.status = WorkerStatus::Idle;
+    
+            //   Store the result somewhere the client can retrieve it.
+            self.results.insert(task_id, _result);
+            return Ok(());
+
+        } else {
+            //   Return Err(RivetError::TaskNotFound(...)) if the task ID is unknown.
+            return Err(RivetError::TaskNotFound(task_id));
+        }
     }
 }
