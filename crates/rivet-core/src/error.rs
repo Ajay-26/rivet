@@ -1,5 +1,5 @@
-use std::fmt;
 use crate::{TaskId, WorkerId};
+use std::fmt;
 
 /// Top-level error type shared across Rivet crates.
 ///

@@ -1,5 +1,7 @@
 use crate::{Scheduler, TaskAssignment};
-use rivet_core::{RivetError, Task, TaskId, TaskResult, WorkerId, WorkerInfo, WorkerStatus};
+use rivet_core::{
+    RivetError, Task, TaskId, TaskPayload, TaskResult, WorkerId, WorkerInfo, WorkerStatus,
+};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 /// A single-process scheduler — all state lives in memory, no networking.
@@ -23,16 +25,16 @@ pub struct LocalScheduler {
     pending: std::collections::VecDeque<Task>,
     workers: std::collections::HashMap<WorkerId, WorkerInfo>,
     assigned: std::collections::HashMap<TaskId, WorkerId>,
-    results: std::collections::HashMap<TaskId, TaskResult>
+    results: std::collections::HashMap<TaskId, TaskResult>,
 }
 
 impl LocalScheduler {
     pub fn new() -> Self {
         return LocalScheduler {
-            pending: std::collections::VecDeque::new(), 
-            workers: std::collections::HashMap::new(), 
+            pending: std::collections::VecDeque::new(),
+            workers: std::collections::HashMap::new(),
             assigned: std::collections::HashMap::new(),
-            results: std::collections::HashMap::new()
+            results: std::collections::HashMap::new(),
         };
     }
 }
@@ -58,7 +60,24 @@ impl Scheduler for LocalScheduler {
         //     - Push a TaskAssignment into the result Vec.
         //
         // TODO (Milestone 3): Replace this greedy round-robin with a real policy.
-        todo!("match pending tasks to idle workers")
+        let mut assignments: Vec<TaskAssignment> = Vec::new();
+        for (worker_id, worker) in self.workers.iter_mut() {
+            if worker.is_available() {
+                let task_opt: Option<Task> = self.pending.pop_front();
+
+                if task_opt.is_some() {
+                    let task = task_opt.unwrap();
+                    worker.status = WorkerStatus::Busy;
+                    self.assigned.insert(task.id, worker.id);
+                    assignments.push(TaskAssignment {
+                        task_id: task.id,
+                        worker_id: worker.id,
+                    });
+                }
+            }
+        }
+        return assignments;
+        // todo!("match pending tasks to idle workers")
     }
 
     fn worker_registered(&mut self, _worker: WorkerInfo) -> Result<(), RivetError> {
@@ -70,24 +89,21 @@ impl Scheduler for LocalScheduler {
     }
 
     fn worker_finished(&mut self, _result: TaskResult) -> Result<(), RivetError> {
-        // TODO (Milestone 1):
-
-
         //   Look up which task just finished (use `result.task_id()`).
         let task_id: TaskId = _result.task_id();
 
         //   Find which worker was running it.
         let worker_id: Option<&WorkerId> = self.assigned.get(&task_id);
-        
-        if let worker = self.workers.get_mut(worker_id.unwrap()).unwrap() {
-            
-            //   Mark that worker Idle again.
-            worker.status = WorkerStatus::Idle;
-    
-            //   Store the result somewhere the client can retrieve it.
-            self.results.insert(task_id, _result);
-            return Ok(());
 
+        if worker_id.is_some() {
+            let worker: &mut WorkerInfo = self.workers.get_mut(worker_id.unwrap()).unwrap();
+            // Mark that worker Idle again.
+            worker.status = WorkerStatus::Idle;
+
+            // Store the result somewhere the client can retrieve it.
+            self.results.insert(task_id, _result);
+
+            return Ok(());
         } else {
             //   Return Err(RivetError::TaskNotFound(...)) if the task ID is unknown.
             return Err(RivetError::TaskNotFound(task_id));

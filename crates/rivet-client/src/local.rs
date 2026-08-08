@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use crate::{Client, ClientError};
 use rivet_core::{Task, TaskId, TaskPayload, TaskResult};
 use rivet_scheduler::{LocalScheduler, Scheduler};
-use crate::{Client, ClientError};
+use std::collections::HashMap;
 
 /// An in-process client that talks directly to a `LocalScheduler`.
 ///

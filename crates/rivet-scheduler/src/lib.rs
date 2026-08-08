@@ -2,7 +2,7 @@ mod local;
 
 pub use local::LocalScheduler;
 
-use rivet_core::{RivetError, Task, TaskId, TaskResult, WorkerInfo, WorkerId};
+use rivet_core::{RivetError, Task, TaskId, TaskResult, WorkerId, WorkerInfo};
 
 /// Maps a single task to the worker that should execute it.
 #[derive(Debug, Clone)]
@@ -103,7 +103,11 @@ mod tests {
         scheduler.submit(task);
 
         let assignments = scheduler.schedule();
-        assert_eq!(assignments.len(), 1, "one task + one worker → one assignment");
+        assert_eq!(
+            assignments.len(),
+            1,
+            "one task + one worker → one assignment"
+        );
         assert_eq!(assignments[0].task_id, task_id);
         assert_eq!(assignments[0].worker_id, worker_id);
     }
@@ -148,6 +152,7 @@ mod tests {
         // After finishing, the worker should be eligible for a new assignment.
         scheduler.submit(Task::new(TaskPayload::new("next-job")));
         let assignments = scheduler.schedule();
+
         assert_eq!(
             assignments.len(),
             1,

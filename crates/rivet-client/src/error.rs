@@ -1,5 +1,5 @@
-use std::fmt;
 use rivet_core::{RivetError, TaskId};
+use std::fmt;
 
 /// Errors that can occur when using the Rivet client.
 ///

@@ -1,5 +1,5 @@
-use rivet_core::{RivetError, Task, TaskResult, WorkerId, WorkerInfo};
 use crate::Worker;
+use rivet_core::{RivetError, Task, TaskResult, WorkerId, WorkerInfo};
 
 /// A worker that runs tasks in the current process.
 ///

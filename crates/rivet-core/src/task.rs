@@ -181,7 +181,10 @@ mod tests {
     #[test]
     fn task_result_success_reports_correct_id() {
         let id = TaskId::new();
-        let result = TaskResult::Success { task_id: id, output: vec![] };
+        let result = TaskResult::Success {
+            task_id: id,
+            output: vec![],
+        };
         assert_eq!(result.task_id(), id);
         assert!(result.is_success());
     }
@@ -189,7 +192,10 @@ mod tests {
     #[test]
     fn task_result_failure_is_not_success() {
         let id = TaskId::new();
-        let result = TaskResult::Failure { task_id: id, error: "boom".into() };
+        let result = TaskResult::Failure {
+            task_id: id,
+            error: "boom".into(),
+        };
         assert_eq!(result.task_id(), id);
         assert!(!result.is_success());
     }
