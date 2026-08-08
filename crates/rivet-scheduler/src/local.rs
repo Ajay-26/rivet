@@ -1,5 +1,6 @@
 use crate::{Scheduler, TaskAssignment};
-use rivet_core::{RivetError, Task, TaskId, TaskResult, WorkerInfo};
+use rivet_core::{RivetError, Task, TaskId, TaskResult, WorkerId, WorkerInfo};
+use std::collections::HashMap;
 use std::collections::VecDeque;
 /// A single-process scheduler — all state lives in memory, no networking.
 ///
@@ -20,8 +21,8 @@ use std::collections::VecDeque;
 #[derive(Debug)]
 pub struct LocalScheduler {
     pending: std::collections::VecDeque<Task>,
+    workers: std::collections::HashMap<WorkerId, WorkerInfo>,
     // Example to get started:
-    //   workers: std::collections::HashMap<WorkerId, WorkerInfo>,
     //   assigned: std::collections::HashMap<TaskId, WorkerId>,
 }
 
@@ -29,6 +30,7 @@ impl LocalScheduler {
     pub fn new() -> Self {
         LocalScheduler {
             pending: VecDeque::new(),
+            workers: HashMap::new(),
         }
     }
 }
@@ -58,10 +60,11 @@ impl Scheduler for LocalScheduler {
     }
 
     fn worker_registered(&mut self, _worker: WorkerInfo) -> Result<(), RivetError> {
-        // TODO (Milestone 1):
-        //   Insert the worker into your workers map.
-        //   Return Err(RivetError::WorkerAlreadyRegistered(...)) if it is a duplicate.
-        todo!("store the new worker")
+        if self.workers.contains_key(&_worker.id) {
+            return Err(RivetError::WorkerAlreadyRegistered(_worker.id));
+        }
+        self.workers.insert(_worker.id, _worker);
+        Ok(())
     }
 
     fn worker_finished(&mut self, _result: TaskResult) -> Result<(), RivetError> {
