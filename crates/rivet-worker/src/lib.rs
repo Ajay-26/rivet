@@ -37,7 +37,7 @@ pub trait Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rivet_core::{TaskPayload, Task, WorkerStatus};
+    use rivet_core::{Task, TaskPayload, WorkerStatus};
 
     #[test]
     fn worker_starts_idle() {
@@ -58,9 +58,15 @@ mod tests {
         let mut worker = LocalWorker::new();
         let task = Task::new(TaskPayload::new("noop"));
         let task_id = task.id;
-        let result = worker.execute(task).expect("execute should not return an error");
+        let result = worker
+            .execute(task)
+            .expect("execute should not return an error");
         assert!(result.is_success(), "a noop task should succeed");
-        assert_eq!(result.task_id(), task_id, "result must reference the original task");
+        assert_eq!(
+            result.task_id(),
+            task_id,
+            "result must reference the original task"
+        );
     }
 
     #[test]
