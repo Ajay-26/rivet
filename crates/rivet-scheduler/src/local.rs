@@ -1,9 +1,5 @@
 use crate::{Scheduler, TaskAssignment};
-use rivet_core::{
-    RivetError, Task, TaskId, TaskPayload, TaskResult, WorkerId, WorkerInfo, WorkerStatus,
-};
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use rivet_core::{RivetError, Task, TaskId, TaskResult, WorkerId, WorkerInfo, WorkerStatus};
 /// A single-process scheduler — all state lives in memory, no networking.
 ///
 /// This is the first implementation you will write. Start here for Milestone 1.
@@ -61,7 +57,7 @@ impl Scheduler for LocalScheduler {
         //
         // TODO (Milestone 3): Replace this greedy round-robin with a real policy.
         let mut assignments: Vec<TaskAssignment> = Vec::new();
-        for (worker_id, worker) in self.workers.iter_mut() {
+        for (_worker_id, worker) in self.workers.iter_mut() {
             if worker.is_available() {
                 let task_opt: Option<Task> = self.pending.pop_front();
 
