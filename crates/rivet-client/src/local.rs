@@ -1,6 +1,7 @@
 use crate::{Client, ClientError};
-use rivet_core::{Task, TaskId, TaskPayload, TaskResult};
+use rivet_core::{Task, TaskId, TaskPayload, TaskResult, WorkerId, WorkerInfo};
 use rivet_scheduler::{LocalScheduler, Scheduler};
+use rivet_worker::{LocalWorker, Worker};
 use std::collections::HashMap;
 
 /// An in-process client that talks directly to a `LocalScheduler`.
@@ -19,8 +20,10 @@ pub struct LocalClient {
 
 impl LocalClient {
     pub fn new() -> Self {
+        let mut scheduler = LocalScheduler::new();
+        scheduler.worker_registered(WorkerInfo::new(WorkerId::new())).unwrap();
         LocalClient {
-            scheduler: LocalScheduler::new(),
+            scheduler: scheduler,
             results: HashMap::new(),
         }
     }
@@ -33,9 +36,24 @@ impl LocalClient {
     /// TODO (Milestone 2): Remove this and replace with a background thread
     /// that calls `scheduler.schedule()` on a timer or on every submission.
     pub fn tick(&mut self) {
-        let _assignments = self.scheduler.schedule();
+        let assignments = self.scheduler.schedule();
+
         // TODO: For each assignment, dispatch the task to a LocalWorker,
         //       collect the result, and store it in self.results.
+        for elt in assignments.into_iter() {
+            let mut worker: LocalWorker = LocalWorker::new();
+            let result = worker.execute(elt.task);
+            match result {
+                Ok(res) => {
+                    self.results.insert(elt.task_id, res);
+                },
+                Err(error) => {
+                    println!("Received error: {}", error);
+                    return;
+                }
+            };
+
+        }
     }
 }
 

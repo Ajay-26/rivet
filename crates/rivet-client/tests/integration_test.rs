@@ -54,20 +54,13 @@ fn get_result_returns_none_for_pending_task() {
     );
 }
 
-/// Milestone 1 + worker — requires both scheduler and LocalWorker::execute.
+/// Milestone 1 — requires scheduler + LocalWorker::execute + LocalClient::tick.
 #[test]
 fn tick_completes_a_submitted_task() {
-    // TODO (Milestone 1/2): Uncomment and implement once execute works.
-    //
-    // let mut client = LocalClient::new();
-    // client
-    //     .worker_registered(rivet_worker::LocalWorker::new())
-    //     .expect("registration should succeed");
-    //
-    // let id = client.submit(TaskPayload::new("noop")).unwrap();
-    // client.tick();
-    //
-    // let result = client.get_result(id).unwrap();
-    // assert!(result.is_some(), "task should be complete after tick");
-    // assert!(result.unwrap().is_success());
+    let mut client = LocalClient::new();
+    let id = client.submit(TaskPayload::new("noop")).unwrap();
+    client.tick();
+    let result = client.get_result(id).unwrap();
+    assert!(result.is_some(), "task should be complete after tick");
+    assert!(result.unwrap().is_success());
 }
