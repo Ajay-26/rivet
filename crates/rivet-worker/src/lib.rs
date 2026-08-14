@@ -73,6 +73,7 @@ mod tests {
     fn worker_returns_to_idle_after_execution() {
         let mut worker = LocalWorker::new();
         let task = Task::new(TaskPayload::new("noop"));
+        assert_eq!(worker.info().status, WorkerStatus::Idle);
         worker.execute(task).unwrap();
         assert_eq!(worker.info().status, WorkerStatus::Idle);
     }

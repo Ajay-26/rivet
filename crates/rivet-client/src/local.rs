@@ -1,8 +1,8 @@
 use crate::{Client, ClientError};
-use rivet_core::{Task, TaskId, TaskPayload, TaskResult, WorkerId, WorkerInfo};
+use rivet_core::{Task, TaskId, TaskPayload, TaskResult, WorkerId, WorkerInfo, RivetError};
 use rivet_scheduler::{LocalScheduler, Scheduler};
 use rivet_worker::{LocalWorker, Worker};
-use std::collections::HashMap;
+use std::{collections::HashMap, thread::JoinHandle};
 
 /// An in-process client that talks directly to a `LocalScheduler`.
 ///
@@ -16,15 +16,23 @@ use std::collections::HashMap;
 pub struct LocalClient {
     scheduler: LocalScheduler,
     results: HashMap<TaskId, TaskResult>,
+    worker_count: usize,
 }
 
 impl LocalClient {
     pub fn new() -> Self {
+        Self::with_workers(1)
+    }
+
+    pub fn with_workers(worker_count: usize) -> Self {
         let mut scheduler = LocalScheduler::new();
-        scheduler.worker_registered(WorkerInfo::new(WorkerId::new())).unwrap();
+        for _ in 0..worker_count {
+            scheduler.worker_registered(WorkerInfo::new(WorkerId::new())).unwrap();
+        }
         LocalClient {
             scheduler: scheduler,
             results: HashMap::new(),
+            worker_count: worker_count
         }
     }
 
@@ -40,19 +48,31 @@ impl LocalClient {
 
         // TODO: For each assignment, dispatch the task to a LocalWorker,
         //       collect the result, and store it in self.results.
+        let mut thread_results: Vec<JoinHandle<Result<TaskResult, RivetError>>> = Vec::with_capacity(self.worker_count);
         for elt in assignments.into_iter() {
-            let mut worker: LocalWorker = LocalWorker::new();
-            let result = worker.execute(elt.task);
+            let handle = std::thread::spawn(move || {
+                let mut worker: LocalWorker = LocalWorker::new();
+                let result = worker.execute(elt.task);
+                return result;
+            });
+            thread_results.push(handle); 
+        }
+
+        for thread_result in thread_results {
+            let result = thread_result.join().unwrap();
             match result {
-                Ok(res) => {
-                    self.results.insert(elt.task_id, res);
-                },
+                Ok(result) => {
+                    let task_id = match result {
+                        TaskResult::Success { task_id, output: _ } => task_id,
+                        TaskResult::Failure { task_id, error: _ } => task_id,
+                    };
+                    self.results.insert(task_id, result);
+                }
                 Err(error) => {
                     println!("Received error: {}", error);
                     return;
                 }
             };
-
         }
     }
 }

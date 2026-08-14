@@ -48,14 +48,15 @@ impl Worker for LocalWorker {
         //   - What should happen if the task panics? (hint: std::panic::catch_unwind)
         //   - How do you pass the output bytes back? What do they represent?
         self.info.status = WorkerStatus::Busy;
+        
         // Task work here.
-        println!("Working on {:?}", _task.id);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
         self.info.status = WorkerStatus::Idle;
 
         return Ok(TaskResult::Success {
             task_id: _task.id,
             output: _task.payload.args,
         });
-        // todo!("execute the task and return a TaskResult")
     }
 }

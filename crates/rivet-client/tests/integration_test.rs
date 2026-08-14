@@ -64,3 +64,22 @@ fn tick_completes_a_submitted_task() {
     assert!(result.is_some(), "task should be complete after tick");
     assert!(result.unwrap().is_success());
 }
+
+#[test]
+fn two_tasks_complete_after_tick() {
+    // Submit two tasks, call tick(), assert both have results.
+    let mut client = LocalClient::with_workers(2);
+    let id1 = client.submit(TaskPayload::new("noop")).unwrap();
+    let id2 = client.submit(TaskPayload::new("noop")).unwrap();
+
+    client.tick();
+
+    let result = client.get_result(id1).unwrap();
+    assert!(result.is_some(), "task should be complete after tick");
+    assert!(result.unwrap().is_success());
+
+    let result = client.get_result(id2).unwrap();
+    assert!(result.is_some(), "task should be complete after tick");
+    assert!(result.unwrap().is_success());
+    
+}
