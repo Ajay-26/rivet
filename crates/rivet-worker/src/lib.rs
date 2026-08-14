@@ -71,11 +71,9 @@ mod tests {
 
     #[test]
     fn worker_returns_to_idle_after_execution() {
-        // TODO (Milestone 2): Uncomment and implement this test once execute works.
-        //
-        // let mut worker = LocalWorker::new();
-        // let task = Task::new(TaskPayload::new("noop"));
-        // worker.execute(task).unwrap();
-        // assert_eq!(worker.info().status, WorkerStatus::Idle);
+        let mut worker = LocalWorker::new();
+        let task = Task::new(TaskPayload::new("noop"));
+        worker.execute(task).unwrap();
+        assert_eq!(worker.info().status, WorkerStatus::Idle);
     }
 }

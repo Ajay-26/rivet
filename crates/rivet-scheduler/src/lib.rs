@@ -9,6 +9,7 @@ use rivet_core::{RivetError, Task, TaskId, TaskResult, WorkerId, WorkerInfo};
 pub struct TaskAssignment {
     pub task_id: TaskId,
     pub worker_id: WorkerId,
+    pub task: Task
 }
 
 /// The core scheduling contract.

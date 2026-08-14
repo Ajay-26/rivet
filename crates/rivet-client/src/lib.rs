@@ -9,7 +9,7 @@ use rivet_core::{TaskId, TaskPayload, TaskResult};
 /// The public API a Rivet client exposes to application code.
 ///
 /// # Example (future — works once Milestone 1 is complete)
-/// ```rust,ignore
+/// 
 /// let mut client = LocalClient::new();
 /// let id = client.submit(TaskPayload::new("add"))?;
 /// // ... later ...

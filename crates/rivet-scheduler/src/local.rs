@@ -68,6 +68,7 @@ impl Scheduler for LocalScheduler {
                     assignments.push(TaskAssignment {
                         task_id: task.id,
                         worker_id: worker.id,
+                        task: task
                     });
                 }
             }
