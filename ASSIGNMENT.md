@@ -188,24 +188,80 @@ fn two_tasks_complete_after_tick() {
 
 ---
 
-## Milestone 3 — Scheduling policy
+## Milestone 3 — A second scheduling policy
 
-**Objective:** replace the greedy first-come-first-served scheduler with a
-least-loaded worker selection.
+**Objective:** make worker selection pluggable, and write a policy that provably
+differs from picking the first available worker.
 
 ### What to implement
 
-- Track how many tasks each worker currently has in flight.
-- In `schedule`, assign each pending task to the worker with the fewest active
-  tasks (break ties arbitrarily).
-- Add a test proving that two tasks are spread across two workers rather than
-  both going to the first one.
+**1. Give workers a capacity.** In `crates/rivet-core/src/worker.rs`, add
+`capacity` and `in_flight` counts to `WorkerInfo`, and narrow `WorkerStatus` to
+liveness only (`Online` / `Offline`) — "busy" is now derivable from
+`in_flight == capacity`, so storing it separately means two copies of one fact.
+`is_available()` becomes "online and below capacity". Add guarded helpers to
+increment and decrement `in_flight` rather than letting callers touch the field.
+
+Without this step there is nothing to schedule *on*: a worker holding at most one
+task has a load of 0 or 1, so "least loaded" and "first available" are the same
+predicate and the two policies below are indistinguishable.
+
+**2. Extract the policy.** Add `crates/rivet-scheduler/src/policy.rs` with a
+`SchedulerPolicy` trait — one method that takes the worker map and the pending
+queue and returns assignments. Move the selection logic out of
+`LocalScheduler::schedule` and behind a `Box<dyn SchedulerPolicy>` field.
+
+Keep the trait object-safe: no methods returning `Self`, no generic methods. A
+constructor in the trait is the usual way to break this by accident.
+
+**3. Implement two policies.** `FirstAvailablePolicy` takes any worker with
+spare capacity. `LeastLoadedPolicy` takes the one with the lowest `in_flight` —
+`min_by_key` is the whole algorithm. Recompute the minimum after each
+assignment; assigning changes the thing you are selecting on.
+
+Drive the loop off pending tasks, not workers. Iterating workers once caps you at
+one assignment per worker regardless of capacity.
+
+#### Implementation notes — `LeastLoadedPolicy`
+
+- The shape is a `while` loop where each pass places exactly one task.
+- To pick the worker: filter `workers.values_mut()` down to available ones and
+  `min_by_key` on `in_flight`. That hands you an `Option<&mut WorkerInfo>` — the
+  `None` case means nobody has room, so stop.
+- Do that selection **inside** the loop. Hoisting it above holds one `&mut` for
+  the whole loop, so you would keep handing tasks to the same worker.
+- Order matters within a pass: confirm a worker is free *before* popping the
+  task. Pop first and you drop the task on the floor when nobody can take it.
+- `min_by_key` returns the first minimum it encounters, and `HashMap` order is
+  arbitrary — so ties break nondeterministically. That is why
+  `least_loaded_balances` asserts a spread of ≤ 1 rather than an exact
+  placement.
+
+### Tests
+
+Unit tests in `policy.rs`. Build a `HashMap` of workers and a `VecDeque` of
+tasks and call the policy directly — no scheduler or client needed.
+
+| Test | Asserts |
+|---|---|
+| `respects_capacity` | one worker, capacity 2, three tasks → exactly 2 assignments, one task still pending |
+| `fills_to_capacity` | one worker, capacity 3, three tasks → 3 assignments, all to that worker |
+| `least_loaded_balances` | 3 workers capacity 2, 4 tasks → max load − min load ≤ 1. First-available can produce (2, 2, 0); least-loaded cannot. |
 
 ### Questions to answer
 
-1. Is your scheduler deterministic? If not, does that matter?
-2. How would you implement *priority* scheduling? What changes in the data
-   model?
+1. Write down an input where your two policies produce different assignments.
+   If you cannot, one of them is not doing what its name claims.
+2. `HashMap` iteration order is arbitrary and varies per run. Where does that
+   leak into first-available's output, and does it matter?
+3. Why does a constructor in a trait prevent `Box<dyn Trait>` from compiling?
+
+### Not in scope
+
+Workers still execute one task at a time in practice — `capacity` is enforced by
+the scheduler's bookkeeping, not by anything in `rivet-worker`. Making a single
+worker genuinely run several tasks at once, and making the client own a durable
+worker pool, is Milestone 4.
 
 ---
 

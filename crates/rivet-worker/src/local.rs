@@ -1,5 +1,5 @@
 use crate::Worker;
-use rivet_core::{RivetError, Task, TaskResult, WorkerId, WorkerInfo, WorkerStatus};
+use rivet_core::{RivetError, Task, TaskResult, WorkerId, WorkerInfo};
 
 /// A worker that runs tasks in the current process.
 ///
@@ -31,11 +31,11 @@ impl Default for LocalWorker {
 }
 
 impl Worker for LocalWorker {
-    fn info(&self) -> &WorkerInfo {
-        &self.info
+    fn get_id(&self) -> &WorkerId {
+        &self.info.id
     }
 
-    fn execute(&mut self, _task: Task) -> Result<TaskResult, RivetError> {
+    fn execute(&self, _task: Task) -> Result<TaskResult, RivetError> {
         // TODO (Milestone 1):
         //   1. Set self.info.status to WorkerStatus::Busy.
         //   2. Run the task. For now, any successful return is fine.
@@ -47,15 +47,13 @@ impl Worker for LocalWorker {
         // Think about:
         //   - What should happen if the task panics? (hint: std::panic::catch_unwind)
         //   - How do you pass the output bytes back? What do they represent?
-        self.info.status = WorkerStatus::Busy;
+
         // Task work here.
-        println!("Working on {:?}", _task.id);
-        self.info.status = WorkerStatus::Idle;
+        std::thread::sleep(std::time::Duration::from_millis(100));
 
         return Ok(TaskResult::Success {
             task_id: _task.id,
             output: _task.payload.args,
         });
-        // todo!("execute the task and return a TaskResult")
     }
 }

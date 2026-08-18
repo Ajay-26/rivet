@@ -1,5 +1,7 @@
+use crate::policy::{FirstAvailablePolicy, SchedulerPolicy, PolicyName, LeastLoadedPolicy};
 use crate::{Scheduler, TaskAssignment};
-use rivet_core::{RivetError, Task, TaskId, TaskResult, WorkerId, WorkerInfo, WorkerStatus};
+use rivet_core::{RivetError, Task, TaskId, TaskResult, WorkerId, WorkerInfo};
+
 /// A single-process scheduler — all state lives in memory, no networking.
 ///
 /// This is the first implementation you will write. Start here for Milestone 1.
@@ -22,6 +24,7 @@ pub struct LocalScheduler {
     workers: std::collections::HashMap<WorkerId, WorkerInfo>,
     assigned: std::collections::HashMap<TaskId, WorkerId>,
     results: std::collections::HashMap<TaskId, TaskResult>,
+    policy: Box<dyn SchedulerPolicy>,
 }
 
 impl LocalScheduler {
@@ -31,6 +34,20 @@ impl LocalScheduler {
             workers: std::collections::HashMap::new(),
             assigned: std::collections::HashMap::new(),
             results: std::collections::HashMap::new(),
+            policy: Box::new(FirstAvailablePolicy {}),
+        };
+    }
+
+    pub fn with_policy(policy_name: &PolicyName) -> Self {
+        return LocalScheduler {
+            pending: std::collections::VecDeque::new(),
+            workers: std::collections::HashMap::new(),
+            assigned: std::collections::HashMap::new(),
+            results: std::collections::HashMap::new(),
+            policy: match policy_name {
+                PolicyName::FirstAvailablePolicyName => Box::new(FirstAvailablePolicy {}),
+                PolicyName::LeastLoadedPolicyName => Box::new(LeastLoadedPolicy {})
+            }
         };
     }
 }
@@ -56,25 +73,12 @@ impl Scheduler for LocalScheduler {
         //     - Push a TaskAssignment into the result Vec.
         //
         // TODO (Milestone 3): Replace this greedy round-robin with a real policy.
-        let mut assignments: Vec<TaskAssignment> = Vec::new();
-        for (_worker_id, worker) in self.workers.iter_mut() {
-            if worker.is_available() {
-                let task_opt: Option<Task> = self.pending.pop_front();
+        let assignments = self.policy.schedule(&mut self.workers, &mut self.pending);
 
-                if task_opt.is_some() {
-                    let task = task_opt.unwrap();
-                    worker.status = WorkerStatus::Busy;
-                    self.assigned.insert(task.id, worker.id);
-                    assignments.push(TaskAssignment {
-                        task_id: task.id,
-                        worker_id: worker.id,
-                        task: task
-                    });
-                }
-            }
+        for a in assignments.iter() {
+            self.assigned.insert(a.task_id, a.worker_id);
         }
         return assignments;
-        // todo!("match pending tasks to idle workers")
     }
 
     fn worker_registered(&mut self, _worker: WorkerInfo) -> Result<(), RivetError> {
@@ -94,8 +98,7 @@ impl Scheduler for LocalScheduler {
 
         if worker_id.is_some() {
             let worker: &mut WorkerInfo = self.workers.get_mut(worker_id.unwrap()).unwrap();
-            // Mark that worker Idle again.
-            worker.status = WorkerStatus::Idle;
+            worker.remove_inflight_task();
 
             // Store the result somewhere the client can retrieve it.
             self.results.insert(task_id, _result);
@@ -105,5 +108,11 @@ impl Scheduler for LocalScheduler {
             //   Return Err(RivetError::TaskNotFound(...)) if the task ID is unknown.
             return Err(RivetError::TaskNotFound(task_id));
         }
+    }
+}
+
+impl LocalScheduler {
+    pub fn get_results(self: &Self) -> &std::collections::HashMap<TaskId, TaskResult> {
+        &self.results
     }
 }
