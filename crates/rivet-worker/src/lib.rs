@@ -2,7 +2,7 @@ mod local;
 
 pub use local::LocalWorker;
 
-use rivet_core::{RivetError, Task, TaskResult, WorkerInfo};
+use rivet_core::{RivetError, Task, TaskResult, WorkerId};
 
 /// The contract every worker implementation must satisfy.
 ///
@@ -23,13 +23,13 @@ use rivet_core::{RivetError, Task, TaskResult, WorkerInfo};
 /// Push (worker calls back to the scheduler) or pull (scheduler polls)?
 pub trait Worker {
     /// Return read-only metadata about this worker.
-    fn info(&self) -> &WorkerInfo;
+    fn get_id(&self) -> &WorkerId;
 
     /// Execute a single task and return its result.
     ///
     /// Implementations should update `self.info().status` to `Busy` while
     /// running and back to `Idle` on completion.
-    fn execute(&mut self, task: Task) -> Result<TaskResult, RivetError>;
+    fn execute(&self, task: Task) -> Result<TaskResult, RivetError>;
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -37,17 +37,7 @@ pub trait Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rivet_core::{Task, TaskPayload, WorkerStatus};
-
-    #[test]
-    fn worker_starts_idle() {
-        let worker = LocalWorker::new();
-        assert_eq!(
-            worker.info().status,
-            WorkerStatus::Idle,
-            "a freshly created worker should be idle"
-        );
-    }
+    use rivet_core::{Task, TaskPayload};
 
     // -------------------------------------------------------------------------
     // This test will FAIL until you implement LocalWorker::execute.
@@ -55,7 +45,7 @@ mod tests {
 
     #[test]
     fn worker_execute_returns_success_result() {
-        let mut worker = LocalWorker::new();
+        let worker = LocalWorker::new();
         let task = Task::new(TaskPayload::new("noop"));
         let task_id = task.id;
         let result = worker
@@ -67,14 +57,5 @@ mod tests {
             task_id,
             "result must reference the original task"
         );
-    }
-
-    #[test]
-    fn worker_returns_to_idle_after_execution() {
-        let mut worker = LocalWorker::new();
-        let task = Task::new(TaskPayload::new("noop"));
-        assert_eq!(worker.info().status, WorkerStatus::Idle);
-        worker.execute(task).unwrap();
-        assert_eq!(worker.info().status, WorkerStatus::Idle);
     }
 }

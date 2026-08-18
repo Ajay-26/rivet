@@ -81,5 +81,4 @@ fn two_tasks_complete_after_tick() {
     let result = client.get_result(id2).unwrap();
     assert!(result.is_some(), "task should be complete after tick");
     assert!(result.unwrap().is_success());
-    
 }

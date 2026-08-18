@@ -35,22 +35,20 @@ impl fmt::Display for WorkerId {
 /// Whether a worker is able to accept new tasks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerStatus {
-    Idle,
-    Busy,
+    Online,
     Offline,
 }
 
 impl Default for WorkerStatus {
     fn default() -> Self {
-        WorkerStatus::Idle
+        WorkerStatus::Online
     }
 }
 
 impl fmt::Display for WorkerStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            WorkerStatus::Idle => write!(f, "Idle"),
-            WorkerStatus::Busy => write!(f, "Busy"),
+            WorkerStatus::Online => write!(f, "Online"),
             WorkerStatus::Offline => write!(f, "Offline"),
         }
     }
@@ -66,14 +64,18 @@ pub struct WorkerInfo {
     pub id: WorkerId,
     pub status: WorkerStatus,
     pub address: Option<String>,
+    pub capacity: usize,
+    pub in_flight: usize,
 }
 
 impl WorkerInfo {
     pub fn new(id: WorkerId) -> Self {
         WorkerInfo {
             id,
-            status: WorkerStatus::Idle,
+            status: WorkerStatus::Online,
             address: None,
+            capacity: 1,
+            in_flight: 0,
         }
     }
 
@@ -82,8 +84,31 @@ impl WorkerInfo {
         self
     }
 
+    pub fn with_capacity(mut self, capacity: usize) -> Self {
+        self.capacity = capacity;
+        return self;
+    }
+
     pub fn is_available(&self) -> bool {
-        self.status == WorkerStatus::Idle
+        (self.status == WorkerStatus::Online) && (self.in_flight < self.capacity)
+    }
+
+    pub fn add_inflight_task(self: &mut Self) -> bool {
+        if self.in_flight < self.capacity {
+            self.in_flight += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn remove_inflight_task(self: &mut Self) -> bool {
+        if self.in_flight > 0 {
+            self.in_flight -= 1;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -103,14 +128,15 @@ mod tests {
     #[test]
     fn new_worker_is_idle_and_available() {
         let info = WorkerInfo::new(WorkerId::new());
-        assert_eq!(info.status, WorkerStatus::Idle);
+        assert_eq!(info.status, WorkerStatus::Online);
         assert!(info.is_available());
     }
 
     #[test]
     fn busy_worker_is_not_available() {
         let mut info = WorkerInfo::new(WorkerId::new());
-        info.status = WorkerStatus::Busy;
+        info.status = WorkerStatus::Online;
+        info.in_flight = 1;
         assert!(!info.is_available());
     }
 
