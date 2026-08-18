@@ -112,16 +112,18 @@ thread boundaries.
 
 ---
 
-### Milestone 3 — Scheduling policy
+### Milestone 3 — A second scheduling policy
 
-**Goal:** the scheduler makes a non-trivial assignment decision.
+**Goal:** make worker selection pluggable and write a policy that provably
+differs from first-available.
 
-- Implement a round-robin or least-loaded worker selection in
-  `LocalScheduler::schedule`.
-- Track worker load (how many tasks each worker currently has).
-- Add a test that verifies two tasks are spread across two workers.
+- Give `WorkerInfo` a `capacity` and an `in_flight` count; narrow
+  `WorkerStatus` to liveness only.
+- Extract selection into a `SchedulerPolicy` trait behind a `Box<dyn ...>`.
+- Implement `FirstAvailablePolicy` and `LeastLoadedPolicy`, and test that they
+  differ.
 
-**Rust concepts:** iterators, `min_by_key`, borrowing in loops.
+**Rust concepts:** trait objects, object safety, supertraits, `min_by_key`.
 
 ---
 
