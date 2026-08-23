@@ -1,4 +1,4 @@
-use crate::policy::{FirstAvailablePolicy, SchedulerPolicy, PolicyName, LeastLoadedPolicy};
+use crate::policy::{FirstAvailablePolicy, LeastLoadedPolicy, PolicyName, SchedulerPolicy};
 use crate::{Scheduler, TaskAssignment};
 use rivet_core::{RivetError, Task, TaskId, TaskResult, WorkerId, WorkerInfo};
 
@@ -29,39 +29,39 @@ pub struct LocalScheduler {
 
 impl LocalScheduler {
     pub fn new() -> Self {
-        return LocalScheduler {
+        LocalScheduler {
             pending: std::collections::VecDeque::new(),
             workers: std::collections::HashMap::new(),
             assigned: std::collections::HashMap::new(),
             results: std::collections::HashMap::new(),
             policy: Box::new(FirstAvailablePolicy {}),
-        };
+        }
     }
 
     pub fn with_policy(policy_name: &PolicyName) -> Self {
-        return LocalScheduler {
+        LocalScheduler {
             pending: std::collections::VecDeque::new(),
             workers: std::collections::HashMap::new(),
             assigned: std::collections::HashMap::new(),
             results: std::collections::HashMap::new(),
             policy: match policy_name {
                 PolicyName::FirstAvailablePolicyName => Box::new(FirstAvailablePolicy {}),
-                PolicyName::LeastLoadedPolicyName => Box::new(LeastLoadedPolicy {})
-            }
-        };
+                PolicyName::LeastLoadedPolicyName => Box::new(LeastLoadedPolicy {}),
+            },
+        }
     }
 }
 
 impl Default for LocalScheduler {
     fn default() -> Self {
-        return Self::new();
+        Self::new()
     }
 }
 
 impl Scheduler for LocalScheduler {
     fn submit(&mut self, _task: Task) -> TaskId {
         self.pending.push_back(_task);
-        return self.pending.back().unwrap().id;
+        self.pending.back().unwrap().id
     }
 
     fn schedule(&mut self) -> Vec<TaskAssignment> {
@@ -78,7 +78,7 @@ impl Scheduler for LocalScheduler {
         for a in assignments.iter() {
             self.assigned.insert(a.task_id, a.worker_id);
         }
-        return assignments;
+        assignments
     }
 
     fn worker_registered(&mut self, _worker: WorkerInfo) -> Result<(), RivetError> {
@@ -103,16 +103,16 @@ impl Scheduler for LocalScheduler {
             // Store the result somewhere the client can retrieve it.
             self.results.insert(task_id, _result);
 
-            return Ok(());
+            Ok(())
         } else {
             //   Return Err(RivetError::TaskNotFound(...)) if the task ID is unknown.
-            return Err(RivetError::TaskNotFound(task_id));
+            Err(RivetError::TaskNotFound(task_id))
         }
     }
 }
 
 impl LocalScheduler {
-    pub fn get_results(self: &Self) -> &std::collections::HashMap<TaskId, TaskResult> {
+    pub fn get_results(&self) -> &std::collections::HashMap<TaskId, TaskResult> {
         &self.results
     }
 }

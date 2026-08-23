@@ -22,33 +22,43 @@ the milestones below, filling in each `todo!()` as you go.
 ## Architecture
 
 ```
-                        ┌──────────────────┐
-                        │     Client       │
-                        │  (submits tasks, │
-                        │  reads results)  │
-                        └────────┬─────────┘
-                                 │ submit / get_result
-                                 ▼
-                        ┌──────────────────┐
-                        │    Scheduler     │
-                        │  (assigns tasks  │
-                        │   to workers)    │
-                        └──┬──────┬──────┬─┘
-                    assign │      │      │ assign
-                           ▼      ▼      ▼
-                       ┌──────┐ ┌──────┐ ┌──────┐
-                       │  W1  │ │  W2  │ │  W3  │
-                       └──────┘ └──────┘ └──────┘
+        ┌──────────────┐   submit / get_result
+        │    Client    │ ──────────────┐
+        └──────────────┘               │
+        ┌──────────────┐               ▼
+        │    Client    │ ────▶ ┌────────────────────┐
+        └──────────────┘       │      Runtime       │
+                               │ owns the scheduler │
+                               │ and the pool       │
+                               └─────────┬──────────┘
+                                         │ asks: which worker?
+                                         ▼
+                               ┌────────────────────┐
+                               │     Scheduler      │
+                               │  (+ policy)        │
+                               └─────────┬──────────┘
+                                         │ assignments
+                           ┌─────────────┼─────────────┐
+                           ▼             ▼             ▼
+                       ┌──────┐      ┌──────┐      ┌──────┐
+                       │  W1  │      │  W2  │      │  W3  │
+                       └──────┘      └──────┘      └──────┘
+                              results ──▶ Runtime
 ```
+
+Clients are thin handles. The **runtime** owns the scheduler and the worker pool
+and moves tasks between them; the **scheduler** only decides placement and never
+touches a worker. That split is what lets Milestone 6 move the runtime into
+another process while the client barely changes.
 
 ### Component roles
 
 | Crate | Role |
 |---|---|
 | `rivet-core` | Shared types: `Task`, `TaskId`, `TaskResult`, `WorkerInfo`, errors |
-| `rivet-scheduler` | Decides which worker runs which task |
+| `rivet-scheduler` | Decides which worker runs which task (`Scheduler` + `SchedulerPolicy`) |
 | `rivet-worker` | Executes tasks and reports results |
-| `rivet-client` | Public API + CLI used by application code |
+| `rivet-client` | The runtime, the client API, and the CLI |
 
 ### Crate dependency graph
 
@@ -127,18 +137,21 @@ differs from first-available.
 
 ---
 
-### Milestone 4 — Worker communication via channels
+### Milestone 4 — Long-lived workers, and a runtime to own them
 
-**Goal:** workers and the scheduler communicate through channels rather than
-direct function calls, preparing for network separation.
+**Goal:** workers become threads you send to, and a new `Runtime` type takes
+ownership of the scheduler and the pool so the client can shrink.
 
-- Replace direct `worker.execute(task)` calls with a channel-based dispatch.
-- Each worker runs its own loop on a background thread, reading from an inbox
-  channel and writing to a result channel.
-- The scheduler sends `TaskAssignment`s to workers through channels.
+- Introduce `LocalRuntime` (`Arc<Mutex<..>>` over scheduler + worker pool +
+  results channel). It spawns workers and drives `tick()`.
+- `LocalClient` shrinks to a handle: `submit` and `get_result`, nothing else.
+- One `mpsc` inbox per worker (the policy chooses between them); one shared
+  results channel back to the runtime.
+- `execute` takes `&self` so N threads can run on one worker.
+- Shut down by dropping senders *then* joining — the reverse order hangs.
 
-**Rust concepts:** `Arc`, `Mutex`, `mpsc::Sender` / `Receiver`, `Send + Sync`,
-lifetime annotations on thread closures.
+**Rust concepts:** `Arc`, `Mutex`, interior mutability, `mpsc::Sender`/`Receiver`,
+`Send` vs `Sync`, `JoinHandle`, `Drop`.
 
 ---
 

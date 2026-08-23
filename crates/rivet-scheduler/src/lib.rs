@@ -1,5 +1,5 @@
 mod local;
-mod policy;
+pub mod policy;
 
 pub use local::LocalScheduler;
 

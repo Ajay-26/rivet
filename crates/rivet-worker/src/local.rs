@@ -1,5 +1,5 @@
 use crate::Worker;
-use rivet_core::{RivetError, Task, TaskResult, WorkerId, WorkerInfo};
+use rivet_core::{RivetError, Task, TaskResult, WorkerId};
 
 /// A worker that runs tasks in the current process.
 ///
@@ -13,13 +13,13 @@ use rivet_core::{RivetError, Task, TaskResult, WorkerId, WorkerInfo};
 ///                     of having `execute` called directly.
 #[derive(Debug)]
 pub struct LocalWorker {
-    info: WorkerInfo,
+    id: WorkerId,
 }
 
 impl LocalWorker {
     pub fn new() -> Self {
         LocalWorker {
-            info: WorkerInfo::new(WorkerId::new()),
+            id: WorkerId::new(),
         }
     }
 }
@@ -32,7 +32,7 @@ impl Default for LocalWorker {
 
 impl Worker for LocalWorker {
     fn get_id(&self) -> &WorkerId {
-        &self.info.id
+        &self.id
     }
 
     fn execute(&self, _task: Task) -> Result<TaskResult, RivetError> {
@@ -51,9 +51,9 @@ impl Worker for LocalWorker {
         // Task work here.
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        return Ok(TaskResult::Success {
+        Ok(TaskResult::Success {
             task_id: _task.id,
             output: _task.payload.args,
-        });
+        })
     }
 }

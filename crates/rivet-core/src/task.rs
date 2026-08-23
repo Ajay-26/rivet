@@ -65,8 +65,10 @@ impl TaskPayload {
 
 /// Where a task is in its lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub enum TaskStatus {
     /// Submitted but not yet given to a worker.
+    #[default]
     Pending,
     /// Assigned to a worker, not yet running.
     Assigned,
@@ -78,11 +80,6 @@ pub enum TaskStatus {
     Failed(String),
 }
 
-impl Default for TaskStatus {
-    fn default() -> Self {
-        TaskStatus::Pending
-    }
-}
 
 impl fmt::Display for TaskStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

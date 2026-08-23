@@ -265,38 +265,408 @@ worker pool, is Milestone 4.
 
 ---
 
-## Milestone 4 — Worker communication via channels
+## Milestone 4 — Long-lived workers, and a runtime to own them
 
-**Objective:** workers and the scheduler communicate through channels, not
-direct function calls.
+**Objective:** stop calling workers and start *sending* to them. Each worker
+becomes one or more threads blocked on an inbox channel, results come back over
+a second channel — and a new `Runtime` type takes ownership of the scheduler and
+the worker pool so the client can shrink to what a client should be.
 
-### What to implement
+Each step below has its own tests. Get each step green before starting the next
+one; debugging channels and ownership at the same time is miserable, and most of
+these tests need nothing from the steps that follow.
 
-Give each `LocalWorker` an inbox channel:
+### Background
+
+Two problems are being fixed at once, and they are related.
+
+**Workers are objects you call.** `tick()` invokes `worker.execute(task)` and
+waits. A real worker is a process that already exists, idle until work arrives —
+something you *send to*. The Rust building block is `std::sync::mpsc`:
+`mpsc::channel()` hands back a `(Sender<T>, Receiver<T>)` pair. Senders clone
+freely; receivers do not, because only one place may take a value out.
+
+**The client owns the whole system.** `LocalClient` currently holds the
+scheduler, and after this milestone it would also hold the worker pool. That is
+not a client — a client submits work and collects results. It should not know
+that workers exist, let alone spawn them.
+
+What is missing is a third role:
+
+```
+Client     submit / get_result. Holds a handle to the runtime. Nothing else.
+Runtime    owns the scheduler and the worker pool. Spawns workers. Drives tick().
+Scheduler  decides placement.  (unchanged this milestone)
+Worker     executes a task.
+```
+
+Note the constraint that fixes where the runtime lives: `rivet-scheduler`
+deliberately does not depend on `rivet-worker`, so the scheduler cannot own the
+pool. The runtime must sit in a crate that depends on both — for now, a new
+module inside `rivet-client`. Milestone 6 promotes it to its own process.
+
+### The shape
+
+```
+LocalRuntime ─┬─ Arc<Mutex<RuntimeInner>> ──┬─ scheduler: LocalScheduler
+              │                             ├─ workers: HashMap<WorkerId, WorkerHandle>
+              │                             ├─ results_rx: Receiver<TaskResult>
+              │                             └─ results: HashMap<TaskId, TaskResult>
+              │
+              └─ .client() ──▶ LocalClient ── same Arc, submit / get_result only
+
+WorkerHandle { id, inbox: Sender<Task>, threads }
+      │
+      └── Arc<Mutex<Receiver<Task>>> ──┬── thread 1 ─┐
+                                       ├── thread 2  ├─ execute ─▶ Sender<TaskResult>
+                                       └── thread 3 ─┘
+```
+
+Two channels, different shapes, different reasons:
+
+- **One task channel per worker.** The policy decides *which* worker gets a
+  task; that only means something if each worker has its own queue.
+- **One results channel for everybody.** The runtime does not care who finished
+  what — the `TaskId` in the result is enough.
+
+---
+
+## Step 1 — `crates/rivet-worker/src/local.rs`: shrink `LocalWorker`
+
+`LocalWorker` becomes a stateless executor. No channels, no status, no knowledge
+that it is on a thread.
 
 ```rust
-struct LocalWorker {
-    info:   WorkerInfo,
-    inbox:  mpsc::Sender<Task>,
-    outbox: mpsc::Receiver<TaskResult>,
+pub struct LocalWorker {
+    id: WorkerId,
 }
 ```
 
-Each worker runs a background thread that:
-1. Reads a `Task` from the inbox.
-2. Executes it.
-3. Sends a `TaskResult` to the outbox.
+Change `Worker::execute` in `src/lib.rs` to take `&self` rather than
+`&mut self`. This is load-bearing: several threads call `execute` on the same
+worker concurrently, and `&mut self` would admit one at a time — concurrent code
+that runs sequentially.
 
-The scheduler sends tasks through `inbox`; the client polls `outbox` in `tick()`.
+With status gone, `Worker::info() -> &WorkerInfo` is a lie: the worker no longer
+maintains a `WorkerInfo`. Narrow it to `id(&self) -> WorkerId`.
+
+Keep the `thread::sleep` in `execute`; you still need work that takes measurable
+time.
+
+**Expect to delete:** `worker_starts_idle` and
+`worker_returns_to_idle_after_execution` — they assert on state that has moved.
+
+### Tests — `crates/rivet-worker/src/lib.rs`
+
+| Test | Asserts |
+|---|---|
+| `execute_returns_success_for_the_given_task` | keep the existing `worker_execute_returns_success_result`; the result's `task_id` matches the task |
+| `worker_reports_its_id` | `id()` returns the `WorkerId` passed to `new` |
+| `one_worker_executes_from_two_threads` | put a `LocalWorker` in an `Arc`, spawn two threads that each call `execute`, join both. **This does not compile if `execute` still takes `&mut self`** — that is the point of the test. |
+
+---
+
+## Step 2 — `crates/rivet-worker/src/handle.rs` (new file): `WorkerHandle`, `spawn`
+
+### Deliverables
+
+- [ ] New file `crates/rivet-worker/src/handle.rs`
+- [ ] `mod handle;` **and** `pub use handle::{spawn, WorkerHandle};` in
+      `crates/rivet-worker/src/lib.rs` — without the re-export, `spawn` is
+      unreachable from `rivet-client` and Step 3 will not compile
+- [ ] `struct WorkerHandle`
+- [ ] `WorkerHandle::send` — the only way to reach the private `inbox`
+- [ ] `fn spawn` — creates the channel, spawns the threads, returns the handle
+- [ ] `impl Drop for WorkerHandle` — drop the sender, *then* join the threads
+- [ ] The five tests at the end of this step
+
+A new module, not an addition to `local.rs`. `LocalWorker` is *what a worker
+does*; this is *how you reach one*.
+
+Imports you will need in `handle.rs`:
+
+```rust
+use crate::{LocalWorker, Worker};
+use rivet_core::{Task, TaskResult, WorkerId};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+```
+
+The handle is the client-facing half of a running worker:
+
+```rust
+pub struct WorkerHandle {
+    pub id: WorkerId,
+    inbox: Option<mpsc::Sender<Task>>,
+    threads: Vec<thread::JoinHandle<()>>,
+}
+```
+
+The `Option` looks gratuitous now; the shutdown section below explains it.
+
+`inbox` is private, so the handle needs a method for the runtime to dispatch
+through — something like `send(&self, task: Task) -> Result<(), RivetError>`.
+Decide what it should do when `inbox` is `None` (shutting down) or when the send
+fails because every worker thread has died.
+
+Then a free function in the same file. It creates the task channel, keeps the
+receiver for the threads, and returns the sender inside the handle — so no
+caller ever holds one half of a pair:
+
+```rust
+pub fn spawn(
+    capacity: usize,
+    results: mpsc::Sender<TaskResult>,
+) -> WorkerHandle
+```
+
+Note there is no `id` parameter: `spawn` mints the `WorkerId` by constructing the
+`LocalWorker`, and the caller reads it back off `handle.id`. That way ids come
+from exactly one place, and the runtime cannot register a `WorkerInfo` under an
+id that does not match a pool entry.
+
+Inside:
+
+1. `let (tx, rx) = mpsc::channel::<Task>();`
+2. `let rx = Arc::new(Mutex::new(rx));` — all `capacity` threads share this.
+3. `let worker = Arc::new(LocalWorker::new());` — likewise; take its id for the
+   handle before you move it into the `Arc`.
+4. Spawn `capacity` threads. **Clone the `Arc`s and the results `Sender` inside
+   the loop**, before each `move` closure. A `move` closure takes ownership, so
+   one clone declared above the loop is consumed by the first iteration and the
+   second will not compile.
+5. Return the handle with `id`, `Some(tx)`, and the join handles.
+
+Each thread loops: take the lock, `recv()`, **release the lock**, execute, send
+the result. `Err` from `recv()` means the channel closed — `break`.
+
+> **Trap.** `while let Ok(task) = rx.lock().unwrap().recv() { ... }` compiles and
+> is wrong. Temporaries in a `while let` scrutinee live for the whole body, so
+> the guard is held while you execute and the other threads queue behind it.
+> Capacity 3 silently becomes capacity 1. Bind it in a `let` statement instead —
+> temporaries there drop at the semicolon:
+> ```rust
+> let received = {
+>     let guard = rx.lock().unwrap();
+>     guard.recv()
+> }; // guard dropped here
+> ```
+
+Two things worth handling rather than ignoring: `execute` returns
+`Result<TaskResult, RivetError>`, and anything you do not send onto the results
+channel is a task that never completes. And `results.send(..)` itself returns a
+`Result` — an `Err` means the runtime hung up, another reason to break.
+
+### Shutdown
+
+A worker thread exits when `recv()` returns `Err`, which happens only once
+**every** `Sender` for its channel has been dropped. So the order is fixed:
+
+1. Drop the inbox sender.
+2. *Then* join the threads.
+
+Join first and you wait forever on a thread politely blocked on a channel you
+are still holding open.
+
+That is what the `Option` is for. A `Drop` impl only gets `&mut self`, so you
+cannot move the sender out of the struct — but `self.inbox.take()` leaves `None`
+behind and hands you the value to drop. Same trick for the threads:
+`self.threads.drain(..)` yields owned `JoinHandle`s you can `join()`.
+
+Note what you get for free once `send` handles the `None` case: after shutdown,
+`inbox` is `None`, so `send` returns `Err` instead of panicking.
+
+Without this impl the threads are *detached* — dropping the handle still ends
+them, because the inbox field drops with it, but nothing waits for them to
+finish. `Drop` is what makes shutdown synchronous.
+
+### Tests — `crates/rivet-worker/src/handle.rs`
+
+These need no scheduler, no runtime, and no client. Build a results channel, call
+`spawn`, send tasks, read results.
+
+| Test | Asserts |
+|---|---|
+| `spawned_worker_executes_a_sent_task` | `spawn(id, 1, tx)`, send one task, `results_rx.recv()` returns a success whose `task_id` matches |
+| `spawned_worker_handles_several_tasks_in_sequence` | capacity 1, send three tasks, receive three results; collect the ids and assert all three appear |
+| `capacity_two_runs_two_tasks_concurrently` | capacity 2, send two tasks, time from send to second result with `Instant::now()`, assert well under 2 × the sleep. **This is the test that catches the `while let` lock trap** — with the guard held across `execute` it takes twice as long. |
+| `dropping_the_handle_stops_the_threads` | `spawn`, then drop the handle (or call your shutdown), and assert it returns promptly rather than hanging |
+| `send_after_shutdown_is_an_error` | after shutdown, `send` returns `Err` rather than panicking |
+
+Tests inside `handle.rs` can reach private fields, so you can assert on
+`threads.len() == capacity` directly if useful.
+
+---
+
+## Step 3 — `crates/rivet-client/src/runtime.rs` (new file): `LocalRuntime`
+
+Register it in `crates/rivet-client/src/lib.rs`:
+
+```rust
+mod runtime;
+pub use runtime::LocalRuntime;
+```
+
+The state lives in a private inner struct; the public type is a handle to it:
+
+```rust
+struct RuntimeInner {
+    scheduler: LocalScheduler,
+    workers: HashMap<WorkerId, WorkerHandle>,
+    results_rx: mpsc::Receiver<TaskResult>,
+    results: HashMap<TaskId, TaskResult>,
+}
+
+pub struct LocalRuntime {
+    inner: Arc<Mutex<RuntimeInner>>,
+}
+```
+
+Why the split: clients and the runtime need to reach the *same* state, possibly
+from different threads. `Arc` gives shared ownership, `Mutex` gives safe
+mutation, and wrapping a private inner struct means callers never see the
+locking. It also lets `tick` take `&self` instead of `&mut self` — interior
+mutability.
+
+`LocalRuntime::new(worker_count, capacity)`:
+
+1. Create the results channel once.
+2. For each worker: mint a `WorkerId`, call `spawn(id, capacity, tx.clone())`,
+   and register a `WorkerInfo::new(id).with_capacity(capacity)` on the
+   scheduler — **the same id**. Mismatched ids mean the scheduler hands you
+   assignments naming workers absent from your map.
+3. Drop the runtime's own copy of the results `Sender` (see Step 5).
+
+`LocalRuntime::client(&self) -> LocalClient` clones the `Arc` and wraps it.
+
+`LocalRuntime::tick(&self)` has two halves:
+
+- **Dispatch.** `schedule()`, then for each assignment look up
+  `assignment.worker_id` and `send` the task to that handle.
+- **Collect.** Drain `results_rx`, and for each result call
+  `scheduler.worker_finished(result)` *before* storing it. That call is what
+  returns capacity to the worker; without it `in_flight` only grows and the pool
+  wedges after one round.
+
+Use `try_recv()` for the drain — `Err(TryRecvError::Empty)` is your exit
+condition and keeps `tick` from blocking. Add a helper that ticks in a loop
+until every submitted task has a result, with a bounded attempt count so a bug
+reports a failure instead of hanging the suite.
+
+### Tests — `crates/rivet-client/src/runtime.rs`
+
+Unit tests here can see `RuntimeInner`'s private fields, which is what makes the
+first two possible.
+
+| Test | Asserts |
+|---|---|
+| `pool_ids_match_registered_worker_ids` | `new(3, 1)`, then every key in `workers` is a worker the scheduler knows about. Catches the id-mismatch bug before it becomes a mystery. |
+| `tick_on_an_idle_runtime_does_nothing` | `new(1, 1)` with nothing submitted; `tick()` returns promptly and `results` stays empty. Proves the drain is non-blocking. |
+| `tick_dispatches_and_collects_one_task` | submit, tick until done, `results` contains the id |
+| `capacity_is_returned_after_completion` | one worker capacity 1, two tasks. Tick until both complete. Fails if `worker_finished` is never called — the second task is stranded forever, so bound your loop. |
+| `backlog_drains_over_several_ticks` | 2 workers × capacity 2, 10 tasks, tick until all 10 have results, assert termination |
+
+---
+
+## Step 4 — `crates/rivet-client/src/local.rs`: shrink `LocalClient`
+
+The client becomes thin:
+
+```rust
+pub struct LocalClient {
+    inner: Arc<Mutex<RuntimeInner>>,
+}
+```
+
+`submit` builds a `Task` and forwards to the scheduler behind the lock;
+`get_result` looks up the id in `results` and clones. That is all. No scheduler
+field, no worker pool, no `tick`.
+
+Usage becomes:
+
+```rust
+let runtime = LocalRuntime::new(4, 2);
+let mut client = runtime.client();
+let id = client.submit(TaskPayload::new("job"))?;
+runtime.tick();
+let result = client.get_result(id)?;
+```
+
+Notice what this buys: at Milestone 6 the client's `Arc<Mutex<..>>` becomes a
+`TcpStream` and *only the client changes*. If the boundary is in the right place,
+that swap is small.
+
+Keep `Client::submit` as `&mut self` so the trait is untouched, even though
+interior mutability no longer requires it.
+
+### Tests — `crates/rivet-client/tests/integration_test.rs`
+
+The existing tests all construct `LocalClient::new()` and will need rewriting
+around `LocalRuntime::new(..).client()`. Their assertions should not change.
+
+| Test | Asserts |
+|---|---|
+| `submit_returns_a_task_id` | (existing) still passes through the new path |
+| `two_submissions_return_different_ids` | (existing) |
+| `get_result_is_none_before_tick` | submit, do *not* tick, `get_result` is `None` |
+| `client_sees_result_after_tick` | submit, tick until done, `get_result` is `Some` and successful |
+| `two_clients_share_one_runtime` | two clients from one runtime, one task each, each sees its own result. Proves the handle split is real rather than two independent systems. |
+| `a_clients_task_is_visible_to_its_sibling` | client A submits, client B calls `get_result` on A's id and finds it. Results live in the runtime, not the client — decide whether you *want* this, and assert whichever way you decide. |
+
+---
+
+## Step 5 — The runtime's side of shutdown
+
+The handle's `Drop` (Step 2) takes care of the worker threads. One trap remains,
+and it is the mirror image: **if the runtime keeps an unused clone of the results
+`Sender`, the results channel never closes.** Hand every clone to a worker and
+drop the original in the constructor.
+
+### Tests
+
+| Test | Asserts |
+|---|---|
+| `dropping_the_runtime_terminates_threads` | build `LocalRuntime::new(2, 2)`, drop it, and return promptly |
+| `drop_after_work_terminates` | submit and complete a few tasks first, *then* drop. Different path: threads are mid-loop rather than freshly blocked. |
+| `shutdown_is_idempotent` | explicit shutdown followed by drop does not panic or double-join |
+
+A hanging test is worse than a failing one — it blocks the suite instead of
+reporting. Do the drop on a spawned thread and assert it finishes within a
+timeout, or use `recv_timeout` rather than `recv` when waiting on a channel to
+close.
+
+---
+
+## Step 6 — `crates/rivet-scheduler/`: nothing
+
+The `Scheduler` trait, `LocalScheduler`, and both policies are untouched.
+Placement was already separated from delivery, so changing how tasks travel does
+not disturb who decides where they go. If you find yourself editing this crate,
+stop and work out why.
+
+---
+
+### End-to-end
+
+One test that exercises the whole path once everything is green:
+
+| Test | Asserts |
+|---|---|
+| `four_workers_run_four_tasks_concurrently` | `LocalRuntime::new(4, 1)`, four sleeping tasks, time the whole submit-and-drain cycle, assert well under 4 × the sleep. Measure *inside* the test — `cargo test` runs test functions in parallel, so suite duration proves nothing. |
 
 ### Questions to answer
 
-1. What is `Arc<Mutex<T>>` and when do you need it? Could you use channels
-   instead of a mutex here?
-2. What does the `Sync` marker trait mean? Which of your types need to be
-   `Sync` to be shared across threads?
-3. What is a *deadlock*? Write a scenario in which your channel-based design
-   could deadlock.
+1. `Receiver<T>` is `Send` but not `Sync`. What is the difference, and why does
+   it force `Arc<Mutex<Receiver>>` rather than a plain `Arc<Receiver>`?
+2. Every thread takes the same mutex to get a task. Why is that not a throughput
+   bottleneck? What change would make it one?
+3. Why must the sender be dropped before the threads are joined? Describe the
+   deadlock precisely.
+4. `tick()` takes `&self` while mutating everything behind it. Where did the
+   `mut` go, and what is now enforced at runtime that used to be enforced at
+   compile time?
+5. What does the client know about workers now? Trace what would have to change
+   in it if the runtime moved to another process.
 
 ---
 
