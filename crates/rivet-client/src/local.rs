@@ -26,11 +26,9 @@ impl Client for LocalClient {
                 let id = runtime.scheduler.submit(task);
                 Ok(id)
             }
-            Err(_) => {
-                Err(ClientError::SubmitFailed(RivetError::Other(String::from(
-                    "Submit failed",
-                ))))
-            }
+            Err(_) => Err(ClientError::SubmitFailed(RivetError::Other(String::from(
+                "Submit failed",
+            )))),
         }
     }
 

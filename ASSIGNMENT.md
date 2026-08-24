@@ -674,14 +674,132 @@ One test that exercises the whole path once everything is green:
 
 **Objective:** the system survives a worker crash and retries the failed task.
 
-### What to implement
+### Background
 
-- Detect when a worker thread panics (use `JoinHandle::join` → `Err`, or
-  `std::panic::catch_unwind` inside the thread).
-- Mark the worker `Offline`.
-- Requeue the failed task in `pending` (up to a configurable `max_retries`).
-- Add a test that panics inside a task and verifies the result is
-  `TaskResult::Failure` (or that a retry succeeds on the second attempt).
+Two different failures hide under the word "crash", and they need different
+handling.
+
+- **A task panics.** The worker thread is fine; the *work* was bad. Catch the
+  panic, report a `Failure`, and retry the task somewhere else.
+- **A worker thread dies.** The panic escaped, or the thread exited. That
+  worker's slots are gone. Mark it `Offline` so the policy stops choosing it.
+
+Getting the first one wrong is worse than it looks: an uncaught panic inside
+`spawn`'s thread loop kills one of the `capacity` threads permanently, and the
+task that caused it is never reported, so `in_flight` never comes back down.
+One bad task silently shrinks the pool.
+
+---
+
+## Step 1 — `crates/rivet-worker/src/local.rs`: give yourself a task that fails
+
+`execute` currently sleeps and succeeds. You need a payload that panics, or
+there is nothing to be tolerant of. Branch on `task.payload.name`: a name like
+`"panic"` panics, everything else behaves as today. Two lines.
+
+## Step 2 — `crates/rivet-worker/src/handle.rs`: catch it in the thread loop
+
+Inside the `for` loop in `spawn`, the call is currently:
+
+```rust
+let result = worker.execute(task);
+```
+
+Wrap it:
+
+```rust
+let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.execute(task)));
+```
+
+Now you have three cases, not two: `Ok(Ok(r))`, `Ok(Err(e))`, and
+`Err(Box<dyn Any + Send>)` for the panic. All three must send something on
+`result_sender` — a `TaskResult::Failure` for the last two. The thread must
+`continue`, not `break`.
+
+`AssertUnwindSafe` is needed because `&LocalWorker` crosses the unwind
+boundary and is not `UnwindSafe`. You are asserting that a panic cannot leave
+the worker in a broken state, which is true here because `LocalWorker` holds
+only an id.
+
+Also add a way for the runtime to notice a dead thread:
+
+```rust
+pub fn is_alive(&self) -> bool   // threads.iter().any(|t| !t.is_finished())
+```
+
+## Step 3 — `crates/rivet-scheduler/`: retry bookkeeping
+
+`worker_finished` receives a `TaskResult`, not a `Task`. To requeue you need
+the task back — and `schedule` already removed it from `pending` when it
+dispatched it, so `pending` is not where you look. Between dispatch and result
+the only copy lives inside the worker thread. The scheduler has to keep one.
+
+You already have a type that holds exactly what is needed:
+
+```rust
+pub struct TaskAssignment { task_id: TaskId, worker_id: WorkerId, task: Task }
+```
+
+So widen the map to hold the whole assignment:
+
+```rust
+assigned: HashMap<TaskId, TaskAssignment>,
+```
+
+In `schedule`, the insert becomes `self.assigned.insert(a.task_id, a.clone())`
+instead of `.insert(a.task_id, a.worker_id)`. `Task` already derives `Clone`.
+
+A tuple — `HashMap<TaskId, (WorkerId, Task)>` — holds the same data, but you
+pay for it at every call site in `.0` and `.1`.
+
+The design a production scheduler uses is different again: one
+`tasks: HashMap<TaskId, Task>` as the single owner, with `pending: VecDeque<TaskId>`
+holding only ids, so requeueing clones nothing. It is the better answer and it
+is out of scope here, because `SchedulerPolicy::schedule` takes
+`&mut VecDeque<Task>` and both policies would change with it. Milestone 7 needs
+lookup-by-id anyway; revisit it there.
+
+Then in `local.rs` add:
+
+```rust
+attempts: HashMap<TaskId, u32>,
+max_retries: u32,
+```
+
+and a `LocalScheduler::with_max_retries(n)` constructor next to `with_policy`.
+
+`worker_finished` grows a branch. On `TaskResult::Success`, behave as today. On
+`TaskResult::Failure`, bump `attempts`; if it is below `max_retries`, push the
+task back onto `pending` and *still* call `remove_inflight_task` so the slot is
+released; otherwise store the failure as the final result.
+
+Add one method to the `Scheduler` trait in `crates/rivet-scheduler/src/lib.rs`:
+
+```rust
+fn worker_offline(&mut self, id: WorkerId) -> Result<(), RivetError>;
+```
+
+It sets `WorkerStatus::Offline` and requeues every task still assigned to that
+worker. `WorkerInfo::is_available` already checks the status, so the policy
+needs no change at all — that is the payoff for narrowing `WorkerStatus` in
+Milestone 3.
+
+## Step 4 — `crates/rivet-client/src/runtime.rs`: notice dead workers
+
+In `tick`, before dispatch, sweep the pool: for any handle where `is_alive()`
+is false, call `scheduler.worker_offline(id)`. Do it before `schedule()` so the
+same tick does not hand work to a corpse.
+
+### Tests
+
+| Test | File | Asserts |
+|---|---|---|
+| `a_panicking_task_returns_a_failure` | `rivet-worker/src/handle.rs` | send a `"panic"` task, a `TaskResult::Failure` arrives |
+| `a_panic_does_not_kill_the_worker_thread` | `rivet-worker/src/handle.rs` | capacity 1: send `"panic"`, then a normal task; the second still completes |
+| `a_failed_task_is_retried` | `rivet-scheduler/src/local.rs` | `max_retries` 1, feed `worker_finished` a `Failure`; the task is back in `pending` |
+| `retries_stop_at_the_limit` | `rivet-scheduler/src/local.rs` | feed `max_retries + 1` failures; the last is stored as the result and `pending` is empty |
+| `an_offline_worker_gets_no_assignments` | `rivet-scheduler/src/local.rs` | two workers, mark one offline, submit two tasks; both go to the survivor |
+| `the_runtime_recovers_from_a_panicking_task` | `rivet-client/src/runtime.rs` | submit a `"panic"` task and a normal one; tick until done; both have results and the normal one succeeded |
 
 ### Questions to answer
 
@@ -689,6 +807,8 @@ One test that exercises the whole path once everything is green:
    when should you use it, and when should you use `Result` instead?
 2. What is the difference between *fail-stop* and *fail-noisy* failure models?
    Which does your implementation provide?
+3. A task that panics deterministically will panic on every retry. What stops
+   `max_retries` from turning one bad task into N wasted slots?
 
 ---
 

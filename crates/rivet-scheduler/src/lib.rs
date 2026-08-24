@@ -47,6 +47,10 @@ pub trait Scheduler {
     /// Called when a worker reports it has finished executing a task.
     /// The scheduler uses this to update task state and mark the worker idle.
     fn worker_finished(&mut self, result: TaskResult) -> Result<(), RivetError>;
+
+    /// It sets WorkerStatus::Offline and requeues every task still assigned to that worker.
+    /// WorkerInfo::is_available already checks the status, so the policy needs no change at all
+    fn worker_offline(&mut self, id: WorkerId) -> Result<(), RivetError>;
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

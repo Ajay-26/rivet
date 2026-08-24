@@ -33,14 +33,12 @@ impl fmt::Display for WorkerId {
 }
 
 /// Whether a worker is able to accept new tasks.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum WorkerStatus {
     #[default]
     Online,
     Offline,
 }
-
 
 impl fmt::Display for WorkerStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

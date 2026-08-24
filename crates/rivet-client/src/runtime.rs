@@ -4,6 +4,7 @@ use rivet_scheduler::{LocalScheduler, Scheduler};
 use rivet_worker::{spawn, WorkerHandle};
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex};
+use std::vec::Vec;
 
 #[derive(Debug)]
 pub(crate) struct RuntimeInner {
@@ -56,6 +57,17 @@ impl LocalRuntime {
         let inner_runtime = self.inner.lock();
         match inner_runtime {
             Ok(mut inner_runtime) => {
+                let mut worker_id_cancel = Vec::<WorkerId>::new();
+                for (worker_id, worker_handle) in inner_runtime.workers.iter() {
+                    if !(worker_handle.is_alive()) {
+                        worker_id_cancel.push(worker_id.clone());
+                    }
+                }
+
+                for id in worker_id_cancel.drain(..) {
+                    let _ = inner_runtime.scheduler.worker_offline(id);
+                }
+
                 let assignments = inner_runtime.scheduler.schedule();
 
                 // Iterate through tasks for each handle
@@ -235,6 +247,60 @@ mod tests {
         for id in ids {
             assert!(inner.scheduler.get_results().contains_key(&id));
         }
+    }
+
+    #[test]
+    fn the_runtime_recovers_from_a_panicking_task() {
+        let mut runtime = LocalRuntime::new(1, 1);
+        let mut client = runtime.client();
+        let bad = client.submit(TaskPayload::new("panic")).unwrap();
+        let good = client.submit(TaskPayload::new("noop")).unwrap();
+
+        assert_eq!(
+            tick_until(&mut runtime, 2),
+            2,
+            "one panicking task stalled the runtime. Its failure must be reported \
+             and its slot released, or the healthy task never gets dispatched."
+        );
+
+        let inner = runtime.inner.lock().unwrap();
+        let results = inner.scheduler.get_results();
+        assert!(
+            !results[&bad].is_success(),
+            "the panicking task should end as a Failure once retries run out"
+        );
+        assert!(
+            results[&good].is_success(),
+            "a healthy task must not be affected by a sibling that panicked"
+        );
+    }
+
+    #[test]
+    fn a_dead_worker_does_not_strand_its_tasks() {
+        // The runtime sweeps for dead handles at the top of tick. Nothing kills a
+        // thread outright today -- panics are caught -- so this test drives the
+        // sweep through the scheduler directly and checks the requeue path is
+        // wired up end to end.
+        let mut runtime = LocalRuntime::new(2, 1);
+        let mut client = runtime.client();
+        let id = client.submit(TaskPayload::new("noop")).unwrap();
+
+        // Dispatch it, then declare its worker dead before the result lands.
+        {
+            let mut inner = runtime.inner.lock().unwrap();
+            let assignments = inner.scheduler.schedule();
+            assert_eq!(assignments.len(), 1);
+            let victim = assignments[0].worker_id;
+            inner.scheduler.worker_offline(victim).unwrap();
+        }
+
+        assert_eq!(
+            tick_until(&mut runtime, 1),
+            1,
+            "the task was in flight on a worker that went offline, so it must be \
+             requeued and run on the survivor"
+        );
+        assert!(runtime.inner.lock().unwrap().scheduler.get_results()[&id].is_success());
     }
 
     #[test]

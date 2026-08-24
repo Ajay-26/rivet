@@ -20,20 +20,16 @@ impl WorkerHandle {
             Some(result) => {
                 let res = result.send(task);
                 match res {
-                    Ok(()) => {
-                        Ok(())
-                    }
-                    Err(res) => {
-                        Err(RivetError::Other(res.to_string()))
-                    }
+                    Ok(()) => Ok(()),
+                    Err(res) => Err(RivetError::Other(res.to_string())),
                 }
             }
-            None => {
-                Err(RivetError::Other(
-                    String::from("Could not call send()") ,
-                ))
-            }
+            None => Err(RivetError::Other(String::from("Could not call send()"))),
         }
+    }
+
+    pub fn is_alive(self: &Self) -> bool {
+        self.threads.iter().any(|t| !t.is_finished())
     }
 }
 
@@ -68,15 +64,25 @@ pub fn spawn(capacity: usize, result_sender: mpsc::Sender<TaskResult>) -> Worker
             match received {
                 Ok(task) => {
                     let task_id = task.id;
-                    let result = worker.execute(task);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        worker.execute(task)
+                    }));
                     match result {
-                        Ok(result) => {
-                            let _ = sender.send(result);
-                        }
-                        Err(err) => {
+                        Ok(result) => match result {
+                            Ok(result) => {
+                                let _ = sender.send(result);
+                            }
+                            Err(err) => {
+                                let _ = sender.send(TaskResult::Failure {
+                                    task_id,
+                                    error: err.to_string(),
+                                });
+                            }
+                        },
+                        Err(_) => {
                             let _ = sender.send(TaskResult::Failure {
                                 task_id,
-                                error: err.to_string(),
+                                error: String::from("Panic/fault in task!"),
                             });
                         }
                     }
@@ -195,6 +201,81 @@ mod tests {
             rx.try_recv().is_ok(),
             "after a joining drop, the in-flight result should already be sent"
         );
+    }
+
+    #[test]
+    fn a_panicking_task_returns_a_failure() {
+        let (tx, rx) = mpsc::channel();
+        let handle = spawn(1, tx);
+
+        let t = task("panic");
+        let id = t.id;
+        handle.send(t).expect("send should succeed");
+
+        let result = rx
+            .recv_timeout(TIMEOUT)
+            .expect("a panicking task must still report something, or the task is lost");
+        assert_eq!(result.task_id(), id);
+        assert!(
+            !result.is_success(),
+            "a panic must be reported as a Failure, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_panic_does_not_kill_the_worker_thread() {
+        // Capacity 1: there is exactly one thread, so if the panic kills it the
+        // second task can never run.
+        let (tx, rx) = mpsc::channel();
+        let handle = spawn(1, tx);
+
+        handle.send(task("panic")).unwrap();
+        let first = rx
+            .recv_timeout(TIMEOUT)
+            .expect("the panic should be reported");
+        assert!(!first.is_success());
+
+        let t = task("noop");
+        let id = t.id;
+        handle.send(t).expect("the inbox should still be open");
+
+        let second = rx.recv_timeout(TIMEOUT).expect(
+            "the only worker thread died with the panicking task. catch_unwind must \
+             be inside the loop, and the loop must continue rather than break.",
+        );
+        assert_eq!(second.task_id(), id);
+        assert!(
+            second.is_success(),
+            "a normal task after a panic should still succeed"
+        );
+    }
+
+    #[test]
+    fn a_panic_does_not_shrink_a_multi_thread_worker() {
+        // Capacity 2, then two panics, then two normal tasks. If a panic takes a
+        // thread with it, the pool is down to zero and this hangs.
+        let (tx, rx) = mpsc::channel();
+        let handle = spawn(2, tx);
+
+        for _ in 0..2 {
+            handle.send(task("panic")).unwrap();
+        }
+        for _ in 0..2 {
+            assert!(!rx
+                .recv_timeout(TIMEOUT)
+                .expect("panic reported")
+                .is_success());
+        }
+
+        for _ in 0..2 {
+            handle.send(task("noop")).unwrap();
+        }
+        for _ in 0..2 {
+            assert!(rx
+                .recv_timeout(TIMEOUT)
+                .expect("both threads should have survived two panics")
+                .is_success());
+        }
     }
 
     #[test]

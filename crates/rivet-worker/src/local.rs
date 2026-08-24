@@ -50,6 +50,9 @@ impl Worker for LocalWorker {
 
         // Task work here.
         std::thread::sleep(std::time::Duration::from_millis(100));
+        if _task.payload.name == "panic" {
+            panic!("Panic on this specific task!");
+        }
 
         Ok(TaskResult::Success {
             task_id: _task.id,
