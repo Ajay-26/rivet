@@ -1,4 +1,4 @@
-use rivet_client::{Client, LocalClient};
+use rivet_client::{Client, LocalRuntime};
 use rivet_core::TaskPayload;
 
 fn main() {
@@ -24,7 +24,8 @@ fn cmd_submit(args: &[String]) {
     // TODO (Milestone 1): Remove the note below once LocalScheduler::submit works.
     println!("Submitting task '{name}'...");
 
-    let mut client = LocalClient::new();
+    let runtime = LocalRuntime::new(1, 1);
+    let mut client = runtime.client();
     match client.submit(TaskPayload::new(name)) {
         Ok(id) => println!("Submitted: {id}"),
         Err(e) => {

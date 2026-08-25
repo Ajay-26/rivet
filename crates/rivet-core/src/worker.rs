@@ -33,16 +33,11 @@ impl fmt::Display for WorkerId {
 }
 
 /// Whether a worker is able to accept new tasks.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum WorkerStatus {
+    #[default]
     Online,
     Offline,
-}
-
-impl Default for WorkerStatus {
-    fn default() -> Self {
-        WorkerStatus::Online
-    }
 }
 
 impl fmt::Display for WorkerStatus {
@@ -86,14 +81,14 @@ impl WorkerInfo {
 
     pub fn with_capacity(mut self, capacity: usize) -> Self {
         self.capacity = capacity;
-        return self;
+        self
     }
 
     pub fn is_available(&self) -> bool {
         (self.status == WorkerStatus::Online) && (self.in_flight < self.capacity)
     }
 
-    pub fn add_inflight_task(self: &mut Self) -> bool {
+    pub fn add_inflight_task(&mut self) -> bool {
         if self.in_flight < self.capacity {
             self.in_flight += 1;
             true
@@ -102,7 +97,7 @@ impl WorkerInfo {
         }
     }
 
-    pub fn remove_inflight_task(self: &mut Self) -> bool {
+    pub fn remove_inflight_task(&mut self) -> bool {
         if self.in_flight > 0 {
             self.in_flight -= 1;
             true

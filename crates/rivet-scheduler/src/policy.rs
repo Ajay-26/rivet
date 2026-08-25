@@ -3,18 +3,18 @@ use rivet_core::{Task, WorkerId, WorkerInfo};
 use std::collections::{HashMap, VecDeque};
 use std::vec::Vec;
 
-pub trait SchedulerPolicy: std::fmt::Debug {
+pub trait SchedulerPolicy: std::fmt::Debug + Send {
     fn schedule(
-        self: &mut Self,
+        &mut self,
         workers: &mut HashMap<WorkerId, WorkerInfo>,
         pending_tasks: &mut VecDeque<Task>,
     ) -> Vec<TaskAssignment>;
 }
 
 #[derive(Debug)]
-pub enum PolicyName{
+pub enum PolicyName {
     FirstAvailablePolicyName,
-    LeastLoadedPolicyName
+    LeastLoadedPolicyName,
 }
 
 #[derive(Debug, Clone)]
@@ -22,13 +22,13 @@ pub struct FirstAvailablePolicy {}
 
 impl SchedulerPolicy for FirstAvailablePolicy {
     fn schedule(
-        self: &mut Self,
+        &mut self,
         workers: &mut HashMap<WorkerId, WorkerInfo>,
         pending_tasks: &mut VecDeque<Task>,
     ) -> Vec<TaskAssignment> {
         let mut assignments: Vec<TaskAssignment> = Vec::new();
 
-        for (_worker_id, worker) in workers.iter_mut() {
+        for worker in workers.values_mut() {
             while worker.is_available() {
                 let task_opt: Option<Task> = pending_tasks.pop_front();
 
@@ -38,14 +38,14 @@ impl SchedulerPolicy for FirstAvailablePolicy {
                     assignments.push(TaskAssignment {
                         task_id: task.id,
                         worker_id: worker.id,
-                        task: task,
+                        task,
                     });
                 } else {
                     break;
                 }
             }
         }
-        return assignments;
+        assignments
     }
 }
 
@@ -54,7 +54,7 @@ pub struct LeastLoadedPolicy {}
 
 impl SchedulerPolicy for LeastLoadedPolicy {
     fn schedule(
-        self: &mut Self,
+        &mut self,
         workers: &mut HashMap<WorkerId, WorkerInfo>,
         pending_tasks: &mut VecDeque<Task>,
     ) -> Vec<TaskAssignment> {
@@ -74,7 +74,7 @@ impl SchedulerPolicy for LeastLoadedPolicy {
                             assignments.push(TaskAssignment {
                                 task_id: task.id,
                                 worker_id: worker.id,
-                                task: task,
+                                task,
                             })
                         }
                         None => {
@@ -88,7 +88,7 @@ impl SchedulerPolicy for LeastLoadedPolicy {
             }
         }
 
-        return assignments;
+        assignments
     }
 }
 
@@ -129,7 +129,11 @@ mod tests {
 
         let assignments = FirstAvailablePolicy {}.schedule(&mut map, &mut queue);
 
-        assert_eq!(assignments.len(), 2, "capacity 2 means at most 2 assignments");
+        assert_eq!(
+            assignments.len(),
+            2,
+            "capacity 2 means at most 2 assignments"
+        );
         assert_eq!(queue.len(), 1, "the third task stays pending");
         assert_eq!(map[&ids[0]].in_flight, 2);
     }

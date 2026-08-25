@@ -1,5 +1,7 @@
+mod handle;
 mod local;
 
+pub use handle::{spawn, WorkerHandle};
 pub use local::LocalWorker;
 
 use rivet_core::{RivetError, Task, TaskResult, WorkerId};

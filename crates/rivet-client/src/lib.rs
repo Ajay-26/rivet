@@ -1,8 +1,10 @@
 pub mod error;
 mod local;
+mod runtime;
 
 pub use error::ClientError;
 pub use local::LocalClient;
+pub use runtime::LocalRuntime;
 
 use rivet_core::{TaskId, TaskPayload, TaskResult};
 

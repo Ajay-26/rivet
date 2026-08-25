@@ -7,14 +7,15 @@
 //! Run with:
 //!     cargo run --example submit_task
 
-use rivet_client::LocalClient;
+use rivet_client::LocalRuntime;
 use rivet_core::TaskPayload;
 
 fn main() {
     println!("=== Rivet: submit_task example ===");
     println!();
 
-    let client = LocalClient::new();
+    let runtime = LocalRuntime::new(1, 1);
+    let client = runtime.client();
 
     // ── Milestone 1 ──────────────────────────────────────────────────────────
     // Uncomment the block below once LocalScheduler::submit is implemented.
