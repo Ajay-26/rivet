@@ -7,5 +7,10 @@ description = "Worker interface and placeholder implementation for Rivet"
 [dependencies]
 rivet-core = { path = "../rivet-core" }
 
+# Milestone 6: the worker binary and RemoteWorkerHandle read and write
+# newline-delimited JSON over a TcpStream.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
 [lints]
 workspace = true

@@ -1,7 +1,7 @@
 use crate::LocalClient;
 use rivet_core::{TaskResult, WorkerId, WorkerInfo, WorkerStatus};
 use rivet_scheduler::{LocalScheduler, Scheduler};
-use rivet_worker::{spawn, WorkerHandle};
+use rivet_worker::{spawn, RemoteWorkerHandle, WorkerTransport};
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex};
 use std::vec::Vec;
@@ -9,11 +9,20 @@ use std::vec::Vec;
 #[derive(Debug)]
 pub(crate) struct RuntimeInner {
     pub(crate) scheduler: LocalScheduler,
-    workers: HashMap<WorkerId, WorkerHandle>,
+    workers: HashMap<WorkerId, Box<dyn WorkerTransport>>,
     results_receiver: mpsc::Receiver<TaskResult>,
 }
 
 #[derive(Debug)]
+// TODO (Milestone 6, Step 4): change the pool to hold either kind of worker.
+//
+//     workers: HashMap<WorkerId, Box<dyn WorkerTransport>>,
+//
+// `WorkerHandle` and `RemoteWorkerHandle` both implement `WorkerTransport`, so
+// one map can hold a mix. `LocalRuntime::new` boxes what `spawn` returns; the
+// dispatch half of `tick` needs no change at all, because it only ever calls
+// `send`. If you find yourself editing `tick`, the trait is in the wrong place.
+
 pub struct LocalRuntime {
     inner: Arc<Mutex<RuntimeInner>>,
 }
@@ -22,7 +31,7 @@ impl LocalRuntime {
     pub fn new(worker_count: usize, capacity: usize) -> Self {
         let scheduler = LocalScheduler::new();
         let (results_sender, results_receiver) = mpsc::channel::<TaskResult>();
-        let workers = HashMap::<WorkerId, WorkerHandle>::new();
+        let workers = HashMap::<WorkerId, Box<dyn WorkerTransport>>::new();
 
         let mut inner = RuntimeInner {
             scheduler,
@@ -39,12 +48,67 @@ impl LocalRuntime {
                 capacity,
                 in_flight: 0,
             });
-            inner.workers.insert(worker.get_id(), worker);
+            inner.workers.insert(worker.get_id(), Box::new(worker));
         }
         drop(results_sender);
         LocalRuntime {
             inner: Arc::new(Mutex::new(inner)),
         }
+    }
+
+    /// Connect to worker processes that are already listening.
+    ///
+    /// The mirror of `new`: instead of spawning threads, it opens a socket to
+    /// each address. Everything after the connection is set up is identical,
+    /// which is the whole point of Milestone 4's split.
+    ///
+    /// TODO (Milestone 6, Step 4):
+    ///   1. Make the results channel exactly as `new` does.
+    ///   2. For each address: mint a `WorkerId` **here** — `WorkerId::new()` is
+    ///      a per-process counter, so a worker that names itself collides with
+    ///      every other worker process.
+    ///   3. `RemoteWorkerHandle::connect(addr, id, results_tx.clone())`.
+    ///   4. Register `WorkerInfo::new(id).with_capacity(handle.capacity())`
+    ///      with the scheduler — the capacity comes from the worker's `Hello`,
+    ///      not from a guess — and `.with_address(addr)`.
+    ///   5. Box the handle into the pool under the same id.
+    ///   6. Drop the runtime's own copy of the sender, same as `new`.
+    ///
+    /// One address failing to connect: decide whether that is fatal or whether
+    /// the runtime should carry on with the workers it did reach. Say which in
+    /// a comment. A cluster that refuses to start because one machine is down
+    /// is usually the wrong answer.
+    pub fn with_remote_workers(_addrs: &[std::net::SocketAddr]) -> std::io::Result<Self> {
+        // todo!("Milestone 6, Step 4: connect to worker processes")
+        let scheduler = LocalScheduler::new();
+        let (results_sender, results_receiver) = mpsc::channel::<TaskResult>();
+        let workers = HashMap::<WorkerId, Box<dyn WorkerTransport>>::new();
+
+        let mut inner = RuntimeInner {
+            scheduler,
+            workers,
+            results_receiver,
+        };
+
+        for addr in _addrs {
+            let worker_id = WorkerId::new();
+            let handle = RemoteWorkerHandle::connect(*addr, worker_id, results_sender.clone())?;
+            let _res = inner.scheduler.worker_registered(WorkerInfo {
+                id: WorkerId::with_id(worker_id.as_u64()),
+                status: WorkerStatus::Online,
+                address: Some(*addr),
+                capacity: handle.capacity(),
+                in_flight: 0,
+            });
+            if _res.is_err() {
+                println!("Error registering worker");
+            }
+            inner.workers.insert(worker_id, Box::new(handle));
+        }
+        drop(results_sender);
+        return Ok(LocalRuntime {
+            inner: Arc::new(Mutex::new(inner)),
+        });
     }
 
     pub fn client(&self) -> LocalClient {
@@ -72,6 +136,7 @@ impl LocalRuntime {
 
                 // Iterate through tasks for each handle
                 for elt in assignments.into_iter() {
+                    println!("Task assignment is {:?}", &elt);
                     let worker_handle = inner_runtime.workers.get(&elt.worker_id);
                     match worker_handle {
                         Some(worker_handle) => {

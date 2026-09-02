@@ -6,3 +6,8 @@ description = "Shared types and abstractions for the Rivet distributed task fram
 
 [lints]
 workspace = true
+
+[dependencies]
+# Milestone 6: Task/TaskResult cross a socket, so they need derives.
+serde = { workspace = true }
+serde_json = { workspace = true }

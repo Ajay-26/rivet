@@ -32,3 +32,49 @@ impl From<RivetError> for ClientError {
         ClientError::SubmitFailed(e)
     }
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_names_the_thing_that_went_wrong() {
+        let id = TaskId::new();
+        assert!(ClientError::TaskNotFound(id)
+            .to_string()
+            .contains(&id.as_u64().to_string()));
+        assert!(ClientError::ConnectionFailed(String::from("refused"))
+            .to_string()
+            .contains("refused"));
+    }
+
+    /// The wrapped error must not be swallowed, or a submit failure reads as
+    /// "submit failed" with no cause.
+    #[test]
+    fn submit_failed_includes_the_underlying_cause() {
+        let inner = RivetError::NoWorkersAvailable;
+        let text = ClientError::SubmitFailed(inner).to_string();
+        assert!(
+            text.contains("no workers available"),
+            "expected the RivetError message inside, got {text:?}"
+        );
+    }
+
+    /// `?` in `LocalClient::submit` relies on this conversion existing.
+    #[test]
+    fn a_rivet_error_converts_into_a_client_error() {
+        let converted: ClientError = RivetError::NoWorkersAvailable.into();
+        assert!(matches!(
+            converted,
+            ClientError::SubmitFailed(RivetError::NoWorkersAvailable)
+        ));
+    }
+
+    #[test]
+    fn client_error_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ClientError>();
+    }
+}

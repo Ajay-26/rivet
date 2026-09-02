@@ -1,18 +1,23 @@
+use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-
 static NEXT_WORKER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A unique identifier for a worker.
 ///
 /// TODO: Same distributed-uniqueness concern as `TaskId` — consider UUIDs
 /// once workers run as separate processes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkerId(u64);
 
 impl WorkerId {
     pub fn new() -> Self {
         WorkerId(NEXT_WORKER_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    pub fn with_id(id: u64) -> Self {
+        WorkerId(id)
     }
 
     pub fn as_u64(self) -> u64 {
@@ -58,7 +63,12 @@ impl fmt::Display for WorkerStatus {
 pub struct WorkerInfo {
     pub id: WorkerId,
     pub status: WorkerStatus,
-    pub address: Option<String>,
+    // TODO (Milestone 6, Step 5): make this `Option<SocketAddr>`.
+    //
+    // A `String` lets "localhsot:7001" travel all the way to a failed connect
+    // at run time. A `SocketAddr` fails at the parse, next to the config that
+    // was wrong. `with_address` should take `impl Into<SocketAddr>`.
+    pub address: Option<SocketAddr>,
     pub capacity: usize,
     pub in_flight: usize,
 }
@@ -74,7 +84,7 @@ impl WorkerInfo {
         }
     }
 
-    pub fn with_address(mut self, address: impl Into<String>) -> Self {
+    pub fn with_address(mut self, address: impl Into<SocketAddr>) -> Self {
         self.address = Some(address.into());
         self
     }
@@ -121,18 +131,82 @@ mod tests {
     }
 
     #[test]
-    fn new_worker_is_idle_and_available() {
+    fn a_new_worker_is_online_and_available() {
         let info = WorkerInfo::new(WorkerId::new());
         assert_eq!(info.status, WorkerStatus::Online);
         assert!(info.is_available());
     }
 
     #[test]
-    fn busy_worker_is_not_available() {
+    fn a_worker_at_capacity_is_not_available() {
         let mut info = WorkerInfo::new(WorkerId::new());
         info.status = WorkerStatus::Online;
-        info.in_flight = 1;
+        info.in_flight = info.capacity;
+        assert!(
+            !info.is_available(),
+            "availability is capacity minus in_flight, not a Busy flag"
+        );
+    }
+
+    #[test]
+    fn default_capacity_is_one() {
+        assert_eq!(
+            WorkerInfo::new(WorkerId::new()).capacity,
+            1,
+            "a worker registered without with_capacity must accept exactly one task"
+        );
+    }
+
+    #[test]
+    fn with_capacity_raises_the_slot_count() {
+        let info = WorkerInfo::new(WorkerId::new()).with_capacity(4);
+        assert_eq!(info.capacity, 4);
+        assert_eq!(info.in_flight, 0);
+        assert!(info.is_available());
+    }
+
+    #[test]
+    fn add_inflight_fills_up_to_capacity_then_refuses() {
+        let mut info = WorkerInfo::new(WorkerId::new()).with_capacity(2);
+        assert!(info.add_inflight_task());
+        assert!(info.add_inflight_task());
+        assert!(
+            !info.add_inflight_task(),
+            "the third add must be refused, or the policy can oversubscribe a worker"
+        );
+        assert_eq!(info.in_flight, 2, "a refused add must not change the count");
+    }
+
+    #[test]
+    fn remove_inflight_refuses_to_go_below_zero() {
+        let mut info = WorkerInfo::new(WorkerId::new()).with_capacity(1);
+        assert!(!info.remove_inflight_task(), "nothing is in flight");
+        assert_eq!(
+            info.in_flight, 0,
+            "usize would wrap, so this must be guarded"
+        );
+    }
+
+    #[test]
+    fn a_full_worker_becomes_available_again_after_a_completion() {
+        let mut info = WorkerInfo::new(WorkerId::new()).with_capacity(1);
+        info.add_inflight_task();
         assert!(!info.is_available());
+        info.remove_inflight_task();
+        assert!(
+            info.is_available(),
+            "this is the loop worker_finished closes; without it the pool wedges"
+        );
+    }
+
+    #[test]
+    fn an_offline_worker_stays_unavailable_even_with_free_slots() {
+        let mut info = WorkerInfo::new(WorkerId::new()).with_capacity(4);
+        info.status = WorkerStatus::Offline;
+        assert!(
+            !info.is_available(),
+            "Milestone 5 relies on status alone taking a worker out of rotation"
+        );
     }
 
     #[test]

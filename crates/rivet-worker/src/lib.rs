@@ -1,8 +1,11 @@
 mod handle;
 mod local;
+pub mod remote;
+pub mod serve;
 
 pub use handle::{spawn, WorkerHandle};
 pub use local::LocalWorker;
+pub use remote::{RemoteWorkerHandle, WorkerTransport};
 
 use rivet_core::{RivetError, Task, TaskResult, WorkerId};
 
@@ -29,8 +32,9 @@ pub trait Worker {
 
     /// Execute a single task and return its result.
     ///
-    /// Implementations should update `self.info().status` to `Busy` while
-    /// running and back to `Idle` on completion.
+    /// Takes `&self`, so one worker can be shared across the threads `spawn`
+    /// creates. Liveness is tracked by the caller, not here — see
+    /// `WorkerHandle::is_alive`.
     fn execute(&self, task: Task) -> Result<TaskResult, RivetError>;
 }
 

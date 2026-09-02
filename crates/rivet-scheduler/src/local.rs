@@ -183,6 +183,7 @@ impl LocalScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::PolicyName;
     use rivet_core::{TaskPayload, WorkerStatus};
 
     fn register(scheduler: &mut LocalScheduler, capacity: usize) -> WorkerId {
@@ -198,6 +199,92 @@ mod tests {
             task_id,
             error: String::from("boom"),
         }
+    }
+
+    /// `with_policy` is the only way to reach `LeastLoadedPolicy` from outside
+    /// the crate, so a wrong arm in the match is invisible until load skews.
+    #[test]
+    fn with_policy_selects_the_named_policy() {
+        for name in [
+            PolicyName::FirstAvailablePolicyName,
+            PolicyName::LeastLoadedPolicyName,
+        ] {
+            let mut scheduler = LocalScheduler::with_policy(&name);
+            register(&mut scheduler, 1);
+            scheduler.submit(Task::new(TaskPayload::new("job")));
+            assert_eq!(
+                scheduler.schedule().len(),
+                1,
+                "{name:?} should still dispatch a single task to a free worker"
+            );
+        }
+    }
+
+    #[test]
+    fn least_loaded_spreads_where_first_available_stacks() {
+        // One worker with 2 slots, one with 1. First-available fills the first
+        // worker; least-loaded takes the emptier one second.
+        let mut scheduler = LocalScheduler::with_policy(&PolicyName::LeastLoadedPolicyName);
+        let big = register(&mut scheduler, 2);
+        let small = register(&mut scheduler, 2);
+
+        scheduler.submit(Task::new(TaskPayload::new("a")));
+        scheduler.submit(Task::new(TaskPayload::new("b")));
+        let assignments = scheduler.schedule();
+
+        assert_eq!(assignments.len(), 2);
+        let mut used: Vec<_> = assignments.iter().map(|a| a.worker_id).collect();
+        used.sort_by_key(|w| w.as_u64());
+        let mut expected = vec![big, small];
+        expected.sort_by_key(|w| w.as_u64());
+        assert_eq!(
+            used, expected,
+            "least-loaded must use both workers before doubling up on either"
+        );
+    }
+
+    #[test]
+    fn registering_the_same_worker_twice_is_rejected() {
+        let mut scheduler = LocalScheduler::new();
+        let id = register(&mut scheduler, 1);
+        let again = scheduler.worker_registered(WorkerInfo::new(id));
+        assert!(
+            matches!(again, Err(RivetError::WorkerAlreadyRegistered(_))),
+            "a duplicate id would silently replace the live worker's state, got {again:?}"
+        );
+    }
+
+    #[test]
+    fn a_result_for_an_unknown_task_is_rejected() {
+        let mut scheduler = LocalScheduler::new();
+        let outcome = scheduler.worker_finished(failure(TaskId::new()));
+        assert!(
+            matches!(outcome, Err(RivetError::TaskNotFound(_))),
+            "a result nobody asked for must not be filed, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_task_is_never_dispatched_twice() {
+        let mut scheduler = LocalScheduler::new();
+        register(&mut scheduler, 4);
+        scheduler.submit(Task::new(TaskPayload::new("once")));
+
+        assert_eq!(scheduler.schedule().len(), 1);
+        assert!(
+            scheduler.schedule().is_empty(),
+            "the second schedule found the task again; dispatch must remove it \
+             from pending"
+        );
+    }
+
+    /// `RuntimeInner` lives behind `Arc<Mutex<..>>`, so the scheduler has to be
+    /// `Send`. It is only `Send` if `Box<dyn SchedulerPolicy>` is, which needs
+    /// the `+ Send` supertrait on the trait declaration.
+    #[test]
+    fn the_scheduler_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<LocalScheduler>();
     }
 
     #[test]

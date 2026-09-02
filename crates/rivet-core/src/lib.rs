@@ -1,5 +1,6 @@
 pub mod error;
 pub mod task;
+pub mod wire;
 pub mod worker;
 
 pub use error::RivetError;
