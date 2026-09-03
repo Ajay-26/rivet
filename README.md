@@ -174,13 +174,18 @@ ownership of the scheduler and the pool so the client can shrink.
 **Goal:** workers run as separate processes; the scheduler communicates with
 them over TCP.
 
-- Choose a wire format (JSON via `serde_json`, or `bincode` for compactness).
-- Implement a simple request/response protocol over `TcpStream`.
-- Workers bind a port and register their address with the scheduler.
-- The scheduler connects to workers and sends tasks over the network.
+- Add a `wire` module to `rivet-core`: newline-delimited JSON, so framing is
+  `BufReader::lines()` rather than something you hand-roll.
+- Build a `rivet-worker` binary that binds a `TcpListener` and pumps tasks into
+  the Milestone 4 thread pool it already has.
+- Put `WorkerHandle` and a new `RemoteWorkerHandle` behind one
+  `WorkerTransport` trait. A reader thread forwards results into the same
+  `mpsc::Sender` the runtime already drains, so `tick()` does not change.
+- Assign `WorkerId`s at the runtime, not in the worker — per-process counters
+  collide.
 
-**Rust concepts:** `serde`, `TcpListener`, `TcpStream`, async I/O (optionally
-`tokio`), serialization.
+**Rust concepts:** `serde`, `TcpListener`, `TcpStream`, `try_clone`, framing,
+`AtomicBool`, trait objects across a transport boundary.
 
 ---
 
@@ -188,10 +193,13 @@ them over TCP.
 
 **Goal:** tasks can declare dependencies on other tasks.
 
-- Add an optional `depends_on: Vec<TaskId>` field to `Task`.
-- The scheduler only assigns a task when all of its dependencies have completed
-  successfully.
-- Detect cycles in the dependency graph.
+- Add `depends_on: Vec<TaskId>` to `Task`.
+- Split *eligibility* (the scheduler's job — it owns the results) from
+  *placement* (the policy's job). A `depends_on` check inside a policy has to be
+  written again in every other policy.
+- `Scheduler::submit` returns `Result<TaskId, _>` so a cycle can be reported.
+- Detect cycles with a three-colour DFS — a plain visited set rejects diamonds.
+- Cascade a permanent failure to its dependents, or they block forever.
 
 ```
 A ──┬──> B ──┐
@@ -239,7 +247,7 @@ As you implement later milestones you may want to add:
 |---|---|---|
 | `serde` + `serde_json` / `bincode` | Task serialization | 6 |
 | `tokio` | Async runtime | 6 (optional) |
-| `uuid` | Distributed-unique task/worker IDs | 6 |
+| `uuid` | Distributed-unique IDs, if you'd rather not assign them centrally | 6 (optional) |
 | `thiserror` | Less boilerplate on error enums | any |
 | `tracing` | Structured logging | any |
 

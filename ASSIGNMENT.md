@@ -814,18 +814,363 @@ same tick does not hand work to a corpse.
 
 ## Milestone 6 — Distributed execution
 
-**Objective:** workers run as separate processes; the scheduler communicates
-with them over TCP.
+**Objective:** workers run as separate OS processes; the runtime talks to them
+over TCP. The scheduler, the policies, and the client do not change.
 
-### What to implement
+### Background
 
-- Each worker binary binds a `TcpListener`, accepts one connection from the
-  scheduler, and processes tasks sent over the socket.
-- Choose a serialization format (`serde_json` is easiest; `bincode` is more
-  compact).
-- The scheduler connects to each registered worker's address and sends
-  serialized `Task`s; workers reply with serialized `TaskResult`s.
-- Update `WorkerInfo::address` from `Option<String>` to `Option<SocketAddr>`.
+This is the milestone Milestone 4 was built for. The runtime reaches a worker
+through exactly three things — `send`, `is_alive`, and results arriving on an
+`mpsc::Receiver`. Nothing else. So a worker that lives on the far end of a
+socket can be made to look identical, and `tick()` never learns the difference.
+
+Three things are genuinely hard here, and none of them existed in-process.
+
+**TCP has no messages.** A channel moves a `Task`. A socket moves bytes. One
+`write` of 400 bytes can arrive as `read`s of 130 and 270, or two writes can
+arrive as one read. You must impose your own message boundaries. This is called
+*framing*, and forgetting it is the classic first networking bug — it works on
+localhost with small payloads and breaks the moment a payload grows.
+
+**Rust cannot send code.** A `Task` is a name and a `Vec<u8>`, not a closure,
+which is why `TaskPayload` was designed that way in Milestone 1. Both processes
+must already contain the function the name refers to.
+
+**Ids are process-local.** `TaskId` and `WorkerId` are `AtomicU64` counters
+(`rivet-core/src/task.rs`). Two worker processes both mint `WorkerId(1)`. Task
+ids are safe because only the runtime creates them, but worker ids are not —
+fix this by having the runtime assign them at handshake, not the worker.
+
+---
+
+## Step 0 — dependencies
+
+The first crates in the project. In `crates/rivet-core/Cargo.toml`:
+
+```toml
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+```
+
+Add the same two to `rivet-worker` and `rivet-client`.
+
+Use **newline-delimited JSON**: one message per line, `\n` as the delimiter.
+This is not laziness — it makes framing a solved problem, because
+`BufReader::lines()` does it for you. `bincode` is more compact and needs a
+length prefix you write yourself; do that later if you want the exercise.
+
+## Step 1 — `crates/rivet-core`: make the types serializable
+
+### What serde actually is
+
+Serde is not a file format. It is **two traits**:
+
+```rust
+trait Serialize   { /* turn me into a stream of fields */ }
+trait Deserialize { /* build me from a stream of fields */ }
+```
+
+A type that implements `Serialize` can describe itself as "a struct with three
+fields, the first is a u64, ...". It does *not* decide what bytes come out.
+That is the format crate's job. `serde_json` turns those descriptions into JSON;
+`bincode` turns the very same descriptions into packed binary. This is why you
+add two crates, not one: `serde` is the vocabulary, `serde_json` is the language.
+
+Writing those impls by hand is tedious, so serde ships a macro:
+
+```rust
+#[derive(Serialize, Deserialize)]
+struct Task { /* ... */ }
+```
+
+That macro lives behind serde's `derive` feature — which is why the root
+`Cargo.toml` says `features = ["derive"]`. Without it the derive is not in
+scope and you get "cannot find derive macro `Serialize`".
+
+### The derives you need
+
+In `crates/rivet-core/src/task.rs`, add `Serialize, Deserialize` to the derive
+lists on `TaskId`, `TaskPayload`, `TaskStatus`, `Task`, and `TaskResult`. In
+`src/worker.rs`, the same on `WorkerId`.
+
+It has to be all of them. Derives are not inherited — the generated code for
+`Task` calls `self.payload.serialize(..)`, so `TaskPayload` must implement it
+too, and `TaskPayload` contains a `String` and a `Vec<u8>`, which serde already
+covers. If you derive on `Task` alone you get:
+
+```
+error[E0277]: the trait bound `TaskPayload: Serialize` is not satisfied
+```
+
+Read that error as "you missed one, and here is which". Work up from the
+innermost type.
+
+At the top of each file you will need:
+
+```rust
+use serde::{Deserialize, Serialize};
+```
+
+### What comes out the other end
+
+Worth knowing before you debug it at 1am. Given `Task { id: TaskId(7), payload:
+TaskPayload { name: "add", args: vec![1, 2] }, status: TaskStatus::Pending }`:
+
+```json
+{"id":7,"payload":{"name":"add","args":[1,2]},"status":"Pending"}
+```
+
+Three things to notice.
+
+- `TaskId(7)` became a bare `7`. A tuple struct with exactly one field is
+  transparent — serde assumes the wrapper is a Rust-side nicety, not data.
+- `TaskStatus::Pending` became the string `"Pending"`. An enum variant with no
+  data serializes as its name.
+- A variant *with* data becomes an object keyed by the variant name.
+  `TaskStatus::Failed("boom")` is `{"Failed":"boom"}`, and
+  `TaskResult::Success { task_id, output }` is
+  `{"Success":{"task_id":7,"output":[]}}`. Serde calls this "externally
+  tagged", and it is the default.
+
+Also notice `args: [1,2]`. A `Vec<u8>` in JSON is an array of numbers, one
+decimal per byte, so a 1 KB payload becomes roughly 4 KB of text. Correct, just
+fat. `serde_bytes` or a base64 field fixes it if you care; do not bother yet.
+
+### The wire protocol
+
+New file `crates/rivet-core/src/wire.rs`, added to `src/lib.rs` with
+`pub mod wire;`. Two enums, both deriving the same pair:
+
+```rust
+#[derive(Debug, Serialize, Deserialize)]
+pub enum WorkerToRuntime {
+    Hello { capacity: usize, version: u32 },
+    Finished(TaskResult),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum RuntimeToWorker {
+    Welcome { worker_id: WorkerId },
+    Run(Task),
+}
+```
+
+**Group them by direction, and name them for it.** The obvious split is
+`Request` and `Response`, and here it is wrong: the worker sends the first
+message *and* the results, while the runtime replies *and* issues the work. Both
+sides send both kinds of thing, so knowing a message is a "request" tells you
+nothing about who wrote it — you end up memorising all four. Named by direction,
+the type answers the question.
+
+One enum per direction also means adding a message later cannot silently break
+the other side — you get a non-exhaustive `match` error instead.
+
+On the wire those look like:
+
+```json
+{"Hello":{"capacity":2,"version":1}}
+{"Run":{"id":9,"payload":{"name":"x","args":[255]},"status":"Pending"}}
+```
+
+`Hello` carries the worker's capacity, so the runtime does not have to guess how
+many slots to register. `Welcome` carries the id the runtime assigned, which is
+the fix for the collision in the Background. `version` is Question 2: compare it
+on receipt and refuse a mismatch loudly.
+
+### Framing, and why newlines
+
+TCP gives you a stream of bytes with no message boundaries. If you write two
+messages and call `read` once, you may get the first, both, or one and a half.
+You need a rule for where one message ends.
+
+The rule here is: **one JSON message per line**. This works because JSON never
+contains a raw newline — a newline inside a string is escaped as `\n`, two
+characters — so an unescaped `\n` is unambiguously a message boundary. And
+`BufRead::read_line` already stops at one, so the whole problem is handled by
+the standard library.
+
+### The two helpers
+
+```rust
+pub fn write_message<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()>
+pub fn read_message<R: BufRead, T: DeserializeOwned>(r: &mut R) -> io::Result<Option<T>>
+```
+
+You will need these imports: `serde::Serialize`, `serde::de::DeserializeOwned`,
+and `std::io::{self, BufRead, Write}`.
+
+The tools are already in the two crates you added. For writing, look at
+`serde_json::to_writer` — note that it does **not** add a trailing newline, so
+the delimiter is yours to append. For reading, `BufRead::read_line` fills a
+`String` and returns how many bytes it read; `serde_json::from_str` turns that
+into your type. Neither function is more than about five lines.
+
+Five things to work out rather than guess at.
+
+**Why generic over `W` and `T`.** One pair of functions has to serve both wire
+enums, over a `TcpStream`, a `Vec<u8>`, or a file. The tests below use
+an in-memory buffer precisely because the functions do not care what they are
+writing to.
+
+**Why `DeserializeOwned` and not `Deserialize`.** This is the one that confuses
+everybody. `Deserialize<'de>` allows a type to *borrow* from the input buffer —
+a `&'de str` field can point straight into the bytes you parsed, with no
+copying. Fast, but the value cannot outlive the buffer. Ask yourself where the
+buffer inside `read_message` lives and when it dies, and the reason the bound
+has to be the owned one will be obvious. Our types use `String` and `Vec`, so
+they satisfy it without any work from you.
+
+**Flushing.** Buffered writers hold bytes back. Work out what happens if the
+last write of a request never reaches the socket while both sides are waiting
+to read. This failure has no error message — the program simply stops — so
+decide now where the flush belongs.
+
+**Signalling that the peer hung up.** `read_line` has a specific return value
+for a clean end of stream, distinct from an IO error. That case is normal
+shutdown, not a failure, and the caller needs to tell them apart. That is why
+the return type is `Option` nested inside `Result`; make sure each of the three
+outcomes maps to the right one.
+
+**Error conversion.** `?` on the `serde_json` call inside a function returning
+`io::Result` compiles, because `serde_json::Error` has a `From` impl into
+`io::Error`. Malformed JSON therefore surfaces as an `Err`, which is correct: it
+means the peer is broken or speaking a different protocol version.
+
+### Why this lives in `rivet-core`
+
+Both ends need these functions, and `rivet-worker` and `rivet-client` do not
+depend on each other — look at the dependency graph in the README. `rivet-core`
+is the only crate both can see.
+
+### Tests for this step
+
+Write these before Step 2. A framing bug found here takes a minute; the same bug
+found through two processes and a socket takes an afternoon.
+
+| Test | Asserts |
+|---|---|
+| `wire_round_trips_every_message` | write then read every variant of both enums into a `Vec<u8>`, get the original back |
+| `read_message_reassembles_a_split_write` | feed the bytes in two chunks; still one whole message out |
+| `read_message_returns_none_at_eof` | an empty reader gives `Ok(None)`, not `Err` |
+| `two_messages_in_one_buffer_read_back_as_two` | write A then B, read twice, get A then B — catches a reader that swallows the rest of the buffer |
+| `a_task_survives_the_round_trip_intact` | id, payload name, and args all match after the trip |
+
+For a `Vec<u8>` buffer, write with `&mut buf`, then read with
+`&mut buf.as_slice()` — `&[u8]` implements `BufRead`, so no socket is needed.
+
+## Step 2 — `crates/rivet-worker/src/bin/rivet-worker.rs` (new file): the worker binary
+
+A second binary in the workspace. It takes a bind address on the command line,
+binds a `TcpListener`, and accepts one connection.
+
+The useful realisation is that you already have the inside of this. `spawn`
+gives you a `capacity`-sized thread pool with panic handling and a results
+channel. So the binary is a pump:
+
+1. `let handle = spawn(capacity, results_tx)` — reuse Milestones 4 and 5 whole.
+2. `stream.try_clone()` to get a second owned handle to the same socket, so one
+   thread can read while another writes.
+3. Read `RuntimeToWorker`s in a loop; each `Run(task)` becomes `handle.send(task)`.
+4. A second thread drains `results_rx` and writes `WorkerToRuntime::Finished` out.
+
+`catch_unwind` is already inside `spawn`'s loop, so a panicking task still
+cannot take this process down. That is Milestone 5 paying for itself.
+
+## Step 3 — `crates/rivet-worker/src/remote.rs` (new file): a handle over a socket
+
+The runtime's map is `HashMap<WorkerId, WorkerHandle>` today, one concrete type.
+Make it hold either kind, with the same trait-object pattern as
+`SchedulerPolicy`:
+
+```rust
+pub trait WorkerTransport: std::fmt::Debug + Send {
+    fn send(&self, task: Task) -> Result<(), RivetError>;
+    fn is_alive(&self) -> bool;
+}
+```
+
+Implement it for `WorkerHandle` — both methods already exist, so the impl block
+is two forwarding lines — and for the new `RemoteWorkerHandle`:
+
+```rust
+pub struct RemoteWorkerHandle {
+    id: WorkerId,
+    stream: Arc<Mutex<TcpStream>>,      // write half
+    alive: Arc<AtomicBool>,             // reader thread clears this
+    reader: Option<JoinHandle<()>>,
+}
+```
+
+`connect(addr, results_tx)` does the handshake, then spawns **one reader
+thread** whose whole job is: `read_message::<WorkerToRuntime>` in a loop, and forward
+each `Finished(result)` into `results_tx`. That is the trick that makes this
+transparent — the runtime keeps draining the same `mpsc::Receiver` it always
+did, and `tick()` needs no change at all.
+
+On EOF or error the reader sets `alive` to `false` and exits. So `is_alive()`
+finally means something: kill the worker process and the next `tick` sweeps it
+offline and requeues its tasks. Milestone 5's Step 4 sweep was untestable
+in-process because a caught panic never kills a thread. Now it is testable.
+
+`send` locks the stream and calls `write_message`. Writes are small, so a mutex
+is fine; a dedicated writer thread fed by a channel is the alternative if you
+want `send` to never block.
+
+## Step 4 — `crates/rivet-client/src/runtime.rs`: connect instead of spawn
+
+Change the field type:
+
+```rust
+workers: HashMap<WorkerId, Box<dyn WorkerTransport>>,
+```
+
+Add a constructor beside `new`:
+
+```rust
+pub fn with_remote_workers(addrs: &[SocketAddr]) -> io::Result<Self>
+```
+
+For each address: connect, handshake, mint the `WorkerId` **here**, and register
+`WorkerInfo::new(id).with_capacity(capacity_from_hello).with_address(addr)`. The
+existing `new(worker_count, capacity)` keeps working and boxes `WorkerHandle`s
+instead.
+
+`tick()` does not change. If it does, the abstraction is in the wrong place —
+go back and look at why.
+
+## Step 5 — `crates/rivet-core/src/worker.rs`: type the address
+
+`address: Option<String>` becomes `Option<SocketAddr>`, and `with_address` takes
+`impl Into<SocketAddr>`. A `String` lets `"localhsot:70001"` reach runtime;
+`SocketAddr` fails at the parse, next to the config that was wrong.
+
+### Tests
+
+| Test | File | Asserts |
+|---|---|---|
+| `wire_round_trips_every_message` | `rivet-core/src/wire.rs` | every variant of both enums survives write-then-read |
+| `read_message_reassembles_a_split_write` | `rivet-core/src/wire.rs` | write one message in two chunks with a pause between; the reader still returns one whole message. **This is the framing test** — it fails if you used `read` instead of `lines`/`read_line` |
+| `read_message_returns_none_at_eof` | `rivet-core/src/wire.rs` | a closed peer is `Ok(None)`, not `Err` |
+| `remote_handle_executes_a_task` | `rivet-worker/src/remote.rs` | stand up a `TcpListener` on `127.0.0.1:0` in the test, connect, send a task, assert a result arrives on `results_rx` |
+| `remote_handle_notices_a_closed_socket` | `rivet-worker/src/remote.rs` | drop the far end; `is_alive()` becomes false |
+| `a_killed_worker_process_requeues_its_tasks` | `rivet-client/tests/` | spawn two real worker processes, submit, kill one mid-task, tick until done, assert every task still has a result |
+| `two_worker_processes_get_distinct_ids` | `rivet-client/tests/` | the collision from the Background section; fails if the worker mints its own id |
+
+Use `127.0.0.1:0` and read back the bound port with `TcpListener::local_addr()`
+— never hard-code a port, or your tests collide with each other and with
+whatever else is on the machine.
+
+For the process-level tests, you need the path to the built worker binary.
+`env!("CARGO_BIN_EXE_rivet-worker")` is the usual answer, but cargo only defines
+it for tests inside the crate that *declares* the binary — and these tests live
+in `rivet-client`. Derive it from `std::env::current_exe()` instead: the test
+binary sits in `target/<profile>/deps/`, so the worker is one directory up.
+Assert the file exists and say so in the message, because
+`cargo test -p rivet-client` on its own will not have built it.
+
+Kill child processes in `Drop`, not at the end of the test. `Drop` runs while a
+panic unwinds; code after a failed assertion does not. Leaked workers hold their
+ports and make the next run fail for the wrong reason.
 
 ### Questions to answer
 
@@ -833,20 +1178,17 @@ with them over TCP.
    channels? List at least three failure modes.
 2. Is your wire protocol versioned? What happens if you deploy a new scheduler
    with old workers?
+3. A worker acknowledges a task, then dies before reporting. You requeue it and
+   it runs elsewhere. Now suppose it had already finished and the *reply* was
+   lost. What did the client observe, and what would you need for
+   exactly-once instead of at-least-once?
 
 ---
 
 ## Milestone 7 — Task graphs
 
-**Objective:** tasks can declare dependencies on other tasks.
-
-### What to implement
-
-Add `depends_on: Vec<TaskId>` to `Task`. The scheduler must not dispatch a task
-until all of its dependencies are in `TaskStatus::Completed`.
-
-Implement a cycle-detection check in `submit` (or `schedule`): if a submitted
-dependency graph contains a cycle, return an error immediately.
+**Objective:** a task can declare that it must not run until other tasks have
+succeeded.
 
 ```
 A ──┬──> B ──┐
@@ -854,12 +1196,171 @@ A ──┬──> B ──┐
     └──> C ──┘
 ```
 
+### Background
+
+Every milestone so far treated `pending` as "runnable". Now it is only
+"submitted", and a second question sits in front of worker selection: *is this
+task allowed to run yet?*
+
+Keep those two questions apart. **Eligibility** is the scheduler's job —
+it owns the results. **Placement** is the policy's job. If you put a
+`depends_on` check inside `FirstAvailablePolicy`, you have to write it again in
+`LeastLoadedPolicy`, and every future policy inherits the bug. This is the same
+boundary as the runtime/scheduler split in Milestone 4, one level down.
+
+Three cases are easy to miss, and each has a test below:
+
+- A dependency **fails permanently**. The dependent can never become eligible.
+  If you only ever gate on success, it sits in `pending` forever and the client
+  blocks on a result that will never come.
+- A dependency is **retried**. It failed once but has attempts left, so the
+  dependent must stay blocked without being cancelled.
+- The graph contains a **cycle**. Nothing is ever eligible and `tick` spins
+  quietly. A silent hang is the worst failure mode in the project; make it a
+  loud error at submit time instead.
+
+---
+
+## Step 1 — `crates/rivet-core/src/task.rs`: the edge list
+
+```rust
+pub struct Task {
+    pub id: TaskId,
+    pub payload: TaskPayload,
+    pub status: TaskStatus,
+    pub depends_on: Vec<TaskId>,
+}
+```
+
+`Task::new` sets it empty, so every existing call site keeps compiling. Add a
+builder next to the ones in `WorkerInfo`:
+
+```rust
+pub fn with_dependencies(mut self, deps: Vec<TaskId>) -> Self
+```
+
+Edges point from dependent to dependency, which is the direction you need when
+asking "can I run?". Building the reverse index — dependency to dependents — is
+Step 4's problem, and it is only an optimisation.
+
+## Step 2 — `crates/rivet-scheduler/src/lib.rs`: `submit` has to be able to fail
+
+```rust
+fn submit(&mut self, task: Task) -> Result<TaskId, RivetError>;
+```
+
+It returns a bare `TaskId` today, so there is no way to report a cycle. Change
+the trait. `Client::submit` in `crates/rivet-client/src/lib.rs` already returns
+`Result<TaskId, ClientError>`, so this plumbs straight through — the only real
+work is the `?` in `LocalClient::submit` and updating the existing tests.
+
+Add to `crates/rivet-core/src/error.rs`:
+
+```rust
+DependencyCycle(TaskId),
+UnknownDependency { task: TaskId, dependency: TaskId },
+```
+
+and their `Display` arms. `UnknownDependency` is the one that catches a typo'd
+id, which otherwise looks exactly like a task that is blocked forever.
+
+## Step 3 — `crates/rivet-scheduler/src/local.rs`: detect cycles at submit
+
+A client may name a dependency it has not submitted yet — it is building a graph
+and the order is its own business. So keep
+
+```rust
+tasks: HashMap<TaskId, Vec<TaskId>>,   // every id ever submitted -> its deps
+```
+
+and on each `submit`, run a depth-first search from the new node. If you reach
+the new node again, that submission closed a cycle: reject it and do not insert.
+Because you only search from one node, this is O(V+E) per submit, not per graph.
+
+Three colours, not a visited set: **white** unvisited, **grey** on the current
+stack, **black** finished. Reaching grey is a cycle; reaching black is a
+diamond, which is legal — look at `D` in the picture above. A plain `HashSet`
+cannot tell those apart and will reject valid graphs.
+
+An unresolved dependency is not an error yet, only an id you have not seen.
+Check `UnknownDependency` when the task is *considered for dispatch*, not at
+submit.
+
+*Simpler alternative, if you want it:* require every dependency to be submitted
+already. Then a dependency always has a lower id, a back-edge is impossible, and
+cycles cannot occur by construction — no detection code at all. It is a real
+design, it is what a topologically-ordered API gives you, and it costs the
+client the freedom to submit in any order. Say in a comment which one you chose.
+
+## Step 4 — `crates/rivet-scheduler/src/local.rs`: gate on eligibility
+
+`schedule` currently hands `&mut self.pending` straight to the policy. Put the
+gate in between:
+
+1. Drain `pending` into two queues, asking of each task: is every id in
+   `depends_on` present in `self.results` **with a successful result**?
+2. Give the policy only the eligible queue.
+3. Push the ineligible ones, plus whatever the policy did not place, back onto
+   `pending`.
+
+Watch the ordering in step 3. If blocked tasks always go to the front, a
+long-blocked task at the head can keep starving newly eligible ones behind it;
+if they always go to the back, a task's position drifts every tick. Preserving
+submission order is the least surprising choice — say which you picked.
+
+This is O(pending × deps) per tick. Fine at this scale. The index that removes
+it is `dependents: HashMap<TaskId, Vec<TaskId>>` plus a per-task
+`remaining_deps` counter, decremented as each dependency succeeds — Kahn's
+algorithm, incrementally. Note it; do not build it yet.
+
+## Step 5 — `crates/rivet-scheduler/src/local.rs`: cascade a permanent failure
+
+In `worker_finished`, the branch that gives up after `max_retries` is where the
+graph has to be told. A task whose dependency failed for good must be failed
+too, with a result the client can actually read:
+
+```rust
+TaskResult::Failure { task_id, error: format!("dependency {dep} failed") }
+```
+
+Do it transitively — the dependents of the dependents fail as well — and remove
+each cascaded task from `pending` as you go. A worklist over
+`dependents` is the natural shape here, which is the first place Step 4's
+reverse index actually earns its keep.
+
+Retries are the case to be careful about: a dependency with attempts left has
+*not* failed permanently, so nothing cascades. Only the final give-up does.
+
+### Tests
+
+| Test | File | Asserts |
+|---|---|---|
+| `a_task_with_no_dependencies_is_unaffected` | `rivet-scheduler/src/local.rs` | the whole M1–M5 suite still holds; `depends_on` empty means dispatch immediately |
+| `a_blocked_task_is_not_dispatched` | `rivet-scheduler/src/local.rs` | B depends on A; with A unfinished, `schedule` returns A only |
+| `a_task_runs_once_its_dependency_succeeds` | `rivet-scheduler/src/local.rs` | complete A, then B dispatches on the next `schedule` |
+| `a_diamond_runs_in_topological_order` | `rivet-scheduler/src/local.rs` | A → {B, C} → D; D dispatches only after both B and C succeed, and the diamond is *not* mistaken for a cycle |
+| `a_dependency_still_retrying_keeps_the_dependent_blocked` | `rivet-scheduler/src/local.rs` | A fails with attempts left; B is neither dispatched nor failed |
+| `a_permanently_failed_dependency_fails_its_dependents` | `rivet-scheduler/src/local.rs` | A exhausts `max_retries`; B gets a `Failure` result and leaves `pending` |
+| `a_failure_cascades_through_a_chain` | `rivet-scheduler/src/local.rs` | A ← B ← C; A fails for good, both B and C get results |
+| `a_self_dependency_is_rejected` | `rivet-scheduler/src/local.rs` | a task depending on itself is `Err(DependencyCycle)` |
+| `a_cycle_is_rejected_at_submit` | `rivet-scheduler/src/local.rs` | A→B→C→A: the third submit errors and the task is not stored |
+| `a_diamond_is_accepted` | `rivet-scheduler/src/local.rs` | the false positive a `HashSet` gives you instead of three colours |
+| `an_unknown_dependency_is_reported` | `rivet-scheduler/src/local.rs` | depending on an id never submitted surfaces `UnknownDependency` rather than blocking forever |
+| `the_runtime_completes_a_dependency_chain` | `rivet-client/src/runtime.rs` | end to end: A → B → C through real workers, tick until done, all three succeed and C's result arrives last |
+
+The last one is the only test that proves the whole path works. Bound its tick
+loop — a cycle bug or a starvation bug both present as "never terminates", and
+you want a failure message, not a hung suite.
+
 ### Questions to answer
 
-1. What algorithm did you use for cycle detection? What is its time complexity
-   in terms of tasks and edges?
-2. How should the scheduler handle a task whose dependency *failed*? Should it
-   cancel the dependent tasks, retry the dependency, or propagate the failure?
+1. What algorithm did you use for cycle detection, and what is its complexity
+   in tasks and edges? Why is a two-state visited set not enough?
+2. A dependency fails. Should the scheduler cancel the dependents, retry the
+   dependency, or propagate the failure? What did you choose, and what would a
+   CI system choose?
+3. `depends_on` gives you a DAG per submission batch, but nothing stops two
+   clients submitting into the same graph. What breaks first?
 
 ---
 

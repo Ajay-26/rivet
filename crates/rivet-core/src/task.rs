@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -10,7 +11,7 @@ static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 ///
 /// TODO: In a distributed system, IDs must be unique across processes.
 /// Consider switching to UUIDs (the `uuid` crate) or a distributed ID scheme.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TaskId(u64);
 
 impl TaskId {
@@ -43,7 +44,7 @@ impl fmt::Display for TaskId {
 ///   c) Make `Task` generic: `Task<T>` where `T: Serialize + Send`.
 ///
 /// Each choice has different trade-offs for type safety, network transport, and ergonomics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskPayload {
     pub name: String,
     pub args: Vec<u8>,
@@ -64,7 +65,7 @@ impl TaskPayload {
 }
 
 /// Where a task is in its lifecycle.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TaskStatus {
     /// Submitted but not yet given to a worker.
     #[default]
@@ -92,7 +93,7 @@ impl fmt::Display for TaskStatus {
 }
 
 /// A task to be executed: its identity, what it should do, and its current state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
     pub payload: TaskPayload,
@@ -115,7 +116,7 @@ impl Task {
 }
 
 /// The outcome of executing a task.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TaskResult {
     Success { task_id: TaskId, output: Vec<u8> },
     Failure { task_id: TaskId, error: String },

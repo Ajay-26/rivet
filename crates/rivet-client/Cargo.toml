@@ -13,5 +13,9 @@ rivet-core      = { path = "../rivet-core" }
 rivet-scheduler = { path = "../rivet-scheduler" }
 rivet-worker    = { path = "../rivet-worker" }
 
+# Milestone 6: the runtime handshakes with remote workers over TCP.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
 [lints]
 workspace = true
