@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crate::policy::{FirstAvailablePolicy, LeastLoadedPolicy, PolicyName, SchedulerPolicy};
 use crate::{Scheduler, TaskAssignment};
 use rivet_core::{RivetError, Task, TaskId, TaskResult, WorkerId, WorkerInfo, WorkerStatus};
@@ -27,6 +29,17 @@ pub struct LocalScheduler {
     policy: Box<dyn SchedulerPolicy>,
     max_retries: u32,
     attempts: std::collections::HashMap<TaskId, u32>,
+    /// `waiting_on[B] == [A]` — "B is waiting on A". Answers "can this run?".
+    ///
+    /// Named this way rather than `dependencies`/`dependents`, which differ by
+    /// two letters and mean opposite things: a swapped index would read like
+    /// correct code.
+    waiting_on: std::collections::HashMap<TaskId, Vec<TaskId>>,
+    /// `blocks[A] == [B]` — "A blocks B". Answers "A failed, who else is doomed?".
+    ///
+    /// The same edges as `waiting_on`, reversed. Kept separately so the failure
+    /// cascade does not have to scan every entry.
+    blocks: std::collections::HashMap<TaskId, Vec<TaskId>>,
 }
 
 impl LocalScheduler {
@@ -39,6 +52,8 @@ impl LocalScheduler {
             policy: Box::new(FirstAvailablePolicy {}),
             max_retries: 4,
             attempts: std::collections::HashMap::new(),
+            waiting_on: std::collections::HashMap::new(),
+            blocks: std::collections::HashMap::new(),
         }
     }
 
@@ -54,6 +69,8 @@ impl LocalScheduler {
             },
             max_retries: 4,
             attempts: std::collections::HashMap::new(),
+            waiting_on: std::collections::HashMap::new(),
+            blocks: std::collections::HashMap::new(),
         }
     }
 
@@ -66,6 +83,8 @@ impl LocalScheduler {
             policy: Box::new(FirstAvailablePolicy {}),
             max_retries: max_retries,
             attempts: std::collections::HashMap::new(),
+            waiting_on: std::collections::HashMap::new(),
+            blocks: std::collections::HashMap::new(),
         }
     }
 }
@@ -76,10 +95,41 @@ impl Default for LocalScheduler {
     }
 }
 
+#[derive(PartialEq)]
+enum ExploredStatus {
+    Unexplored,
+    Exploring,
+    Explored,
+}
+
 impl Scheduler for LocalScheduler {
-    fn submit(&mut self, _task: Task) -> TaskId {
+    fn submit(&mut self, mut _task: Task) -> Result<TaskId, RivetError> {
+        let deps = std::mem::take(&mut _task.depends_on);
+        for dep_id in deps.iter() {
+            self.blocks
+                .entry(dep_id.clone())
+                .or_insert_with(Vec::new)
+                .push(_task.id.clone());
+        }
+        let mut explored = std::collections::HashMap::<TaskId, ExploredStatus>::new();
+        let valid = self.valid_submission(&(_task.id), &mut explored);
+        if valid.is_err() {
+            // Dependency, so now let's remove the entries we just added.
+            // This is a roundabout way of checking for dependencies.
+            // It is only helpful if we allow multiple copies of the same task with different dependencies to be submitted.
+            // It is only here to add to the programming exercise.
+            for dep_id in deps.iter() {
+                let _ = self
+                    .blocks
+                    .entry(dep_id.clone())
+                    .or_insert_with(Vec::new)
+                    .pop();
+            }
+            return Err(valid.err().unwrap());
+        }
+        self.waiting_on.insert(_task.id, deps);
         self.pending.push_back(_task);
-        self.pending.back().unwrap().id
+        Ok(self.pending.back().unwrap().id)
     }
 
     fn schedule(&mut self) -> Vec<TaskAssignment> {
@@ -91,7 +141,48 @@ impl Scheduler for LocalScheduler {
         //     - Push a TaskAssignment into the result Vec.
         //
         // TODO (Milestone 3): Replace this greedy round-robin with a real policy.
-        let assignments = self.policy.schedule(&mut self.workers, &mut self.pending);
+        let mut ready = VecDeque::<Task>::new();
+        let mut not_ready = VecDeque::<Task>::new();
+        for task in self.pending.drain(std::ops::RangeFull) {
+            let items = self.waiting_on.get(&(task.id));
+            match items {
+                Some(items) => {
+                    let mut is_ready = true;
+                    for elt in items {
+                        let res = self.results.get(elt);
+                        match res {
+                            Some(TaskResult::Success {
+                                task_id: _task_id,
+                                output: _output,
+                            }) => {}
+                            Some(TaskResult::Failure {
+                                task_id: _task_id,
+                                error: _error,
+                            }) => {
+                                is_ready = false;
+                                break;
+                            }
+                            None => {
+                                is_ready = false;
+                                break;
+                            }
+                        }
+                    }
+                    if is_ready {
+                        ready.push_back(task);
+                    } else {
+                        not_ready.push_back(task);
+                    }
+                }
+                None => {
+                    ready.push_back(task);
+                }
+            }
+        }
+        let assignments = self.policy.schedule(&mut self.workers, &mut ready);
+
+        ready.append(&mut not_ready);
+        self.pending = ready;
 
         for a in assignments.iter() {
             self.assigned.insert(a.task_id, a.clone());
@@ -129,7 +220,7 @@ impl Scheduler for LocalScheduler {
                     let attempts = self.attempts.entry(task_id).or_insert(1);
 
                     // Launch another attempt of the task, if valid
-                    if *attempts + 1 < self.max_retries {
+                    if *attempts < self.max_retries {
                         self.attempts.entry(task_id).and_modify(|e| {
                             *e += 1;
                         });
@@ -139,6 +230,33 @@ impl Scheduler for LocalScheduler {
                     // Otherwise the task has failed, insert the result
                     } else {
                         self.results.insert(task_id, _result);
+
+                        let mut doomed = std::collections::HashSet::<TaskId>::new();
+                        let mut todo_list = std::vec::Vec::<TaskId>::from([task_id]);
+
+                        while !todo_list.is_empty() {
+                            let x = todo_list.pop().unwrap();
+                            let blocked = self.blocks.get(&x);
+                            match blocked {
+                                Some(blocked) => {
+                                    for elt in blocked.iter() {
+                                        doomed.insert(elt.clone());
+                                        todo_list.push(elt.clone());
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
+                        self.pending.retain(|x| !doomed.contains(&(x.id)));
+                        for d in doomed.drain() {
+                            self.results.insert(
+                                d,
+                                TaskResult::Failure {
+                                    task_id: d,
+                                    error: format!("dependency {} failed", d),
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -163,7 +281,12 @@ impl Scheduler for LocalScheduler {
 
                 for task_id in stranded.iter() {
                     let assignment = self.assigned.remove(task_id).unwrap();
-                    self.submit(assignment.task);
+                    // Requeueing a task that was already accepted cannot
+                    // introduce a cycle, so this error is not reachable. Log
+                    // rather than discard, in case that ever stops being true.
+                    if let Err(e) = self.submit(assignment.task) {
+                        eprintln!("could not requeue task {task_id}: {e}");
+                    }
                 }
                 Ok(())
             }
@@ -175,6 +298,31 @@ impl Scheduler for LocalScheduler {
 impl LocalScheduler {
     pub fn get_results(&self) -> &std::collections::HashMap<TaskId, TaskResult> {
         &self.results
+    }
+
+    fn valid_submission(
+        self: &Self,
+        starting_point: &TaskId,
+        explored: &mut std::collections::HashMap<TaskId, ExploredStatus>,
+    ) -> Result<(), RivetError> {
+        let entry = explored
+            .entry(starting_point.clone())
+            .or_insert(ExploredStatus::Unexplored);
+        if *entry == ExploredStatus::Exploring {
+            return Err(RivetError::DependencyCycle(starting_point.clone()));
+        }
+        *entry = ExploredStatus::Exploring;
+        let ngbs = self.blocks.get(starting_point);
+        if ngbs.is_some() {
+            for ngb in ngbs.unwrap() {
+                let res = self.valid_submission(ngb, explored);
+                if res.is_err() {
+                    return res;
+                }
+            }
+        }
+        explored.insert(*starting_point, ExploredStatus::Explored);
+        return Ok(());
     }
 }
 
@@ -211,7 +359,9 @@ mod tests {
         ] {
             let mut scheduler = LocalScheduler::with_policy(&name);
             register(&mut scheduler, 1);
-            scheduler.submit(Task::new(TaskPayload::new("job")));
+            scheduler
+                .submit(Task::new(TaskPayload::new("job")))
+                .expect("submit should accept this task");
             assert_eq!(
                 scheduler.schedule().len(),
                 1,
@@ -228,8 +378,12 @@ mod tests {
         let big = register(&mut scheduler, 2);
         let small = register(&mut scheduler, 2);
 
-        scheduler.submit(Task::new(TaskPayload::new("a")));
-        scheduler.submit(Task::new(TaskPayload::new("b")));
+        scheduler
+            .submit(Task::new(TaskPayload::new("a")))
+            .expect("submit should accept this task");
+        scheduler
+            .submit(Task::new(TaskPayload::new("b")))
+            .expect("submit should accept this task");
         let assignments = scheduler.schedule();
 
         assert_eq!(assignments.len(), 2);
@@ -268,7 +422,9 @@ mod tests {
     fn a_task_is_never_dispatched_twice() {
         let mut scheduler = LocalScheduler::new();
         register(&mut scheduler, 4);
-        scheduler.submit(Task::new(TaskPayload::new("once")));
+        scheduler
+            .submit(Task::new(TaskPayload::new("once")))
+            .expect("submit should accept this task");
 
         assert_eq!(scheduler.schedule().len(), 1);
         assert!(
@@ -292,7 +448,9 @@ mod tests {
         let mut scheduler = LocalScheduler::with_max_retries(4);
         register(&mut scheduler, 1);
 
-        let id = scheduler.submit(Task::new(TaskPayload::new("flaky")));
+        let id = scheduler
+            .submit(Task::new(TaskPayload::new("flaky")))
+            .expect("submit should accept this task");
         assert_eq!(scheduler.schedule().len(), 1, "the task should dispatch");
         assert!(scheduler.pending.is_empty(), "dispatch empties pending");
 
@@ -320,7 +478,9 @@ mod tests {
         let mut scheduler = LocalScheduler::with_max_retries(4);
         let worker = register(&mut scheduler, 1);
 
-        let id = scheduler.submit(Task::new(TaskPayload::new("flaky")));
+        let id = scheduler
+            .submit(Task::new(TaskPayload::new("flaky")))
+            .expect("submit should accept this task");
         scheduler.schedule();
         assert_eq!(scheduler.workers[&worker].in_flight, 1);
 
@@ -343,7 +503,9 @@ mod tests {
         let mut scheduler = LocalScheduler::with_max_retries(3);
         register(&mut scheduler, 1);
 
-        let id = scheduler.submit(Task::new(TaskPayload::new("always-fails")));
+        let id = scheduler
+            .submit(Task::new(TaskPayload::new("always-fails")))
+            .expect("submit should accept this task");
 
         // Keep failing it until the scheduler stops handing it back out.
         let mut dispatches = 0;
@@ -382,8 +544,12 @@ mod tests {
 
         scheduler.worker_offline(dead).expect("dead is registered");
 
-        scheduler.submit(Task::new(TaskPayload::new("a")));
-        scheduler.submit(Task::new(TaskPayload::new("b")));
+        scheduler
+            .submit(Task::new(TaskPayload::new("a")))
+            .expect("submit should accept this task");
+        scheduler
+            .submit(Task::new(TaskPayload::new("b")))
+            .expect("submit should accept this task");
 
         let assignments = scheduler.schedule();
         assert_eq!(
@@ -407,7 +573,9 @@ mod tests {
         let mut scheduler = LocalScheduler::new();
         let dead = register(&mut scheduler, 1);
 
-        let id = scheduler.submit(Task::new(TaskPayload::new("stranded")));
+        let id = scheduler
+            .submit(Task::new(TaskPayload::new("stranded")))
+            .expect("submit should accept this task");
         scheduler.schedule();
         assert!(scheduler.pending.is_empty(), "the task is now in flight");
 
@@ -434,5 +602,347 @@ mod tests {
             matches!(result, Err(RivetError::WorkerNotFound(_))),
             "marking an unregistered worker offline should be an error, got {result:?}"
         );
+    }
+}
+
+// ── Milestone 7 tests: task graphs ───────────────────────────────────────────
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+    use crate::policy::PolicyName;
+    use rivet_core::TaskPayload;
+
+    fn register(scheduler: &mut LocalScheduler, capacity: usize) -> WorkerId {
+        let id = WorkerId::new();
+        scheduler
+            .worker_registered(WorkerInfo::new(id).with_capacity(capacity))
+            .expect("registration should succeed");
+        id
+    }
+
+    fn task(name: &str, waits_for: Vec<TaskId>) -> Task {
+        Task::new(TaskPayload::new(name)).with_dependencies(waits_for)
+    }
+
+    fn success(task_id: TaskId) -> TaskResult {
+        TaskResult::Success {
+            task_id,
+            output: Vec::new(),
+        }
+    }
+
+    fn failure(task_id: TaskId) -> TaskResult {
+        TaskResult::Failure {
+            task_id,
+            error: String::from("boom"),
+        }
+    }
+
+    /// Submit a task and return its id. The id is minted by `Task::new`, so we
+    /// have to read it before handing the task over.
+    fn submit(scheduler: &mut LocalScheduler, t: Task) -> TaskId {
+        let id = t.id;
+        scheduler.submit(t).expect("submit should accept this task");
+        id
+    }
+
+    // ── Eligibility ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_task_with_no_dependencies_is_unaffected() {
+        let mut scheduler = LocalScheduler::new();
+        register(&mut scheduler, 4);
+        let id = submit(&mut scheduler, task("lonely", Vec::new()));
+
+        let got = scheduler.schedule();
+        assert_eq!(got.len(), 1, "an empty dependency list must not block");
+        assert_eq!(got[0].task_id, id);
+    }
+
+    #[test]
+    fn submit_takes_the_dependency_list_off_the_task() {
+        // The graph belongs to the scheduler. `Task.depends_on` only carries it
+        // one hop. If this ever fails, a dependency list is crossing the socket
+        // to a worker that has no use for it.
+        let mut scheduler = LocalScheduler::new();
+        let a = submit(&mut scheduler, task("a", Vec::new()));
+        let b = submit(&mut scheduler, task("b", vec![a]));
+
+        assert_eq!(
+            scheduler.waiting_on.get(&b).map(|v| v.as_slice()),
+            Some([a].as_slice()),
+            "the scheduler must keep the edges"
+        );
+        let stored = scheduler
+            .pending
+            .iter()
+            .find(|t| t.id == b)
+            .expect("b is queued");
+        assert!(
+            stored.depends_on.is_empty(),
+            "the list must be taken off the task, not copied"
+        );
+    }
+
+    #[test]
+    fn a_blocked_task_is_not_dispatched() {
+        let mut scheduler = LocalScheduler::new();
+        register(&mut scheduler, 4);
+        let a = submit(&mut scheduler, task("a", Vec::new()));
+        let b = submit(&mut scheduler, task("b", vec![a]));
+
+        let got = scheduler.schedule();
+        assert_eq!(got.len(), 1, "only A is ready; got {got:?}");
+        assert_eq!(got[0].task_id, a);
+        assert_ne!(got[0].task_id, b, "B must wait for A");
+    }
+
+    #[test]
+    fn a_task_runs_once_its_dependency_succeeds() {
+        let mut scheduler = LocalScheduler::new();
+        register(&mut scheduler, 4);
+        let a = submit(&mut scheduler, task("a", Vec::new()));
+        let b = submit(&mut scheduler, task("b", vec![a]));
+
+        scheduler.schedule();
+        scheduler.worker_finished(success(a)).unwrap();
+
+        let got = scheduler.schedule();
+        assert_eq!(got.len(), 1, "A is done, so B should run; got {got:?}");
+        assert_eq!(got[0].task_id, b);
+    }
+
+    #[test]
+    fn a_failed_dependency_never_unblocks_its_dependent() {
+        // A failure is still a result. Checking only "is there a result?" would
+        // let B run even though A can never succeed.
+        let mut scheduler = LocalScheduler::with_max_retries(1);
+        register(&mut scheduler, 4);
+        let a = submit(&mut scheduler, task("a", Vec::new()));
+        submit(&mut scheduler, task("b", vec![a]));
+
+        scheduler.schedule();
+        scheduler.worker_finished(failure(a)).unwrap();
+        assert!(scheduler.results.contains_key(&a), "A failed for good");
+
+        assert!(
+            scheduler.schedule().is_empty(),
+            "B waits on a task that will never succeed, so it must never run"
+        );
+    }
+
+    #[test]
+    fn a_diamond_runs_in_topological_order() {
+        // A -> {B, C} -> D. D may only run after both B and C succeed.
+        let mut scheduler = LocalScheduler::new();
+        register(&mut scheduler, 8);
+        let a = submit(&mut scheduler, task("a", Vec::new()));
+        let b = submit(&mut scheduler, task("b", vec![a]));
+        let c = submit(&mut scheduler, task("c", vec![a]));
+        let d = submit(&mut scheduler, task("d", vec![b, c]));
+
+        assert_eq!(scheduler.schedule().len(), 1, "only A is ready");
+        scheduler.worker_finished(success(a)).unwrap();
+
+        let mut second: Vec<_> = scheduler.schedule().iter().map(|x| x.task_id).collect();
+        second.sort_by_key(|i| i.as_u64());
+        let mut want = vec![b, c];
+        want.sort_by_key(|i| i.as_u64());
+        assert_eq!(second, want, "B and C unblock together");
+
+        scheduler.worker_finished(success(b)).unwrap();
+        assert!(
+            scheduler.schedule().is_empty(),
+            "D needs both B and C, not just one"
+        );
+
+        scheduler.worker_finished(success(c)).unwrap();
+        let last = scheduler.schedule();
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0].task_id, d, "D runs last");
+    }
+
+    #[test]
+    fn both_policies_respect_dependencies() {
+        // The gate belongs to the scheduler, not to a policy. If it ever moves
+        // into one, the other policy loses it and this test fails.
+        for name in [
+            PolicyName::FirstAvailablePolicyName,
+            PolicyName::LeastLoadedPolicyName,
+        ] {
+            let mut scheduler = LocalScheduler::with_policy(&name);
+            register(&mut scheduler, 4);
+            let a = submit(&mut scheduler, task("a", Vec::new()));
+            submit(&mut scheduler, task("b", vec![a]));
+
+            let got = scheduler.schedule();
+            assert_eq!(got.len(), 1, "{name:?} dispatched a blocked task");
+            assert_eq!(got[0].task_id, a, "{name:?} picked the wrong task");
+        }
+    }
+
+    // ── Cycles ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_self_dependency_is_rejected() {
+        let mut scheduler = LocalScheduler::new();
+        let mut t = task("loop", Vec::new());
+        t.depends_on = vec![t.id];
+
+        let outcome = scheduler.submit(t);
+        assert!(
+            matches!(outcome, Err(RivetError::DependencyCycle(_))),
+            "a task depending on itself must be refused; got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_cycle_is_rejected_at_submit() {
+        // A waits on C, B waits on A, C waits on B. The third submit closes it.
+        let mut scheduler = LocalScheduler::new();
+        let (a, b, c) = (TaskId::new(), TaskId::new(), TaskId::new());
+
+        let mut ta = task("a", vec![c]);
+        ta.id = a;
+        let mut tb = task("b", vec![a]);
+        tb.id = b;
+        let mut tc = task("c", vec![b]);
+        tc.id = c;
+
+        assert!(
+            scheduler.submit(ta).is_ok(),
+            "naming a task that is not submitted yet is allowed"
+        );
+        assert!(scheduler.submit(tb).is_ok());
+
+        let outcome = scheduler.submit(tc);
+        assert!(
+            matches!(outcome, Err(RivetError::DependencyCycle(_))),
+            "the third submit closes the loop; got {outcome:?}"
+        );
+        assert!(
+            !scheduler.pending.iter().any(|t| t.id == c),
+            "a rejected task must not be stored"
+        );
+    }
+
+    #[test]
+    fn a_diamond_is_accepted() {
+        // The false positive a single visited set gives you. Submitting A last
+        // makes the walk reach D by two different paths.
+        let mut scheduler = LocalScheduler::new();
+        let (a, b, c, d) = (TaskId::new(), TaskId::new(), TaskId::new(), TaskId::new());
+
+        let mut tb = task("b", vec![a]);
+        tb.id = b;
+        let mut tc = task("c", vec![a]);
+        tc.id = c;
+        let mut td = task("d", vec![b, c]);
+        td.id = d;
+        let mut ta = task("a", Vec::new());
+        ta.id = a;
+
+        scheduler.submit(tb).unwrap();
+        scheduler.submit(tc).unwrap();
+        scheduler.submit(td).unwrap();
+        assert!(
+            scheduler.submit(ta).is_ok(),
+            "reaching D twice is a diamond, not a cycle. Two states are needed: \
+             on the current path, and already finished."
+        );
+    }
+
+    #[test]
+    fn a_long_chain_is_accepted() {
+        let mut scheduler = LocalScheduler::new();
+        let mut previous = submit(&mut scheduler, task("step-0", Vec::new()));
+        for i in 1..20 {
+            previous = submit(&mut scheduler, task(&format!("step-{i}"), vec![previous]));
+        }
+    }
+
+    // ── Failure cascade ──────────────────────────────────────────────────────
+
+    #[test]
+    fn a_permanently_failed_dependency_fails_what_it_blocks() {
+        let mut scheduler = LocalScheduler::with_max_retries(1);
+        register(&mut scheduler, 4);
+        let a = submit(&mut scheduler, task("a", Vec::new()));
+        let b = submit(&mut scheduler, task("b", vec![a]));
+
+        scheduler.schedule();
+        scheduler.worker_finished(failure(a)).unwrap();
+
+        let b_result = scheduler
+            .results
+            .get(&b)
+            .expect("B can never run, so it needs a result of its own");
+        assert!(!b_result.is_success(), "B's result must be a failure");
+        assert!(
+            !scheduler.pending.iter().any(|t| t.id == b),
+            "B must also leave the queue, or it sits there for ever"
+        );
+    }
+
+    #[test]
+    fn a_failure_cascades_through_a_chain() {
+        // A <- B <- C. A fails, so both B and C are doomed.
+        let mut scheduler = LocalScheduler::with_max_retries(1);
+        register(&mut scheduler, 4);
+        let a = submit(&mut scheduler, task("a", Vec::new()));
+        let b = submit(&mut scheduler, task("b", vec![a]));
+        let c = submit(&mut scheduler, task("c", vec![b]));
+
+        scheduler.schedule();
+        scheduler.worker_finished(failure(a)).unwrap();
+
+        assert!(scheduler.results.contains_key(&b), "B waits on A");
+        assert!(
+            scheduler.results.contains_key(&c),
+            "C waits on B, so the walk must go all the way down the chain"
+        );
+        assert!(scheduler.pending.is_empty(), "nothing is left to run");
+    }
+
+    #[test]
+    fn a_dependency_still_retrying_keeps_the_dependent_blocked() {
+        // A has attempts left, so it has not failed. Nothing cascades yet.
+        let mut scheduler = LocalScheduler::with_max_retries(4);
+        register(&mut scheduler, 4);
+        let a = submit(&mut scheduler, task("a", Vec::new()));
+        let b = submit(&mut scheduler, task("b", vec![a]));
+
+        scheduler.schedule();
+        scheduler.worker_finished(failure(a)).unwrap();
+
+        assert!(
+            !scheduler.results.contains_key(&a),
+            "A still has attempts left"
+        );
+        assert!(
+            !scheduler.results.contains_key(&b),
+            "so B must be neither dispatched nor failed"
+        );
+
+        let got = scheduler.schedule();
+        assert_eq!(got.len(), 1, "A is retried, B stays blocked; got {got:?}");
+        assert_eq!(got[0].task_id, a);
+    }
+
+    #[test]
+    fn a_task_blocked_by_two_failures_is_only_failed_once() {
+        let mut scheduler = LocalScheduler::with_max_retries(1);
+        register(&mut scheduler, 4);
+        let a = submit(&mut scheduler, task("a", Vec::new()));
+        let b = submit(&mut scheduler, task("b", Vec::new()));
+        let c = submit(&mut scheduler, task("c", vec![a, b]));
+
+        scheduler.schedule();
+        scheduler.worker_finished(failure(a)).unwrap();
+        scheduler.worker_finished(failure(b)).unwrap();
+
+        assert!(scheduler.results.contains_key(&c), "C is doomed either way");
+        assert!(scheduler.pending.is_empty());
     }
 }

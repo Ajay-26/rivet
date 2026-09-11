@@ -29,7 +29,7 @@ pub struct TaskAssignment {
 /// is the right approach for your use case.
 pub trait Scheduler {
     /// Accept a new task. Returns the ID assigned to it.
-    fn submit(&mut self, task: Task) -> TaskId;
+    fn submit(&mut self, task: Task) -> Result<TaskId, RivetError>;
 
     /// Compute a list of task-to-worker assignments for all pending tasks
     /// that can currently be dispatched.
@@ -70,7 +70,9 @@ mod tests {
         let mut scheduler = LocalScheduler::new();
         let task = Task::new(TaskPayload::new("greet"));
         let expected_id = task.id;
-        let returned_id = scheduler.submit(task);
+        let returned_id = scheduler
+            .submit(task)
+            .expect("submit should accept this task");
         assert_eq!(
             expected_id, returned_id,
             "submit should return the ID that was already on the task"
@@ -80,7 +82,9 @@ mod tests {
     #[test]
     fn scheduler_produces_no_assignments_without_workers() {
         let mut scheduler = LocalScheduler::new();
-        scheduler.submit(Task::new(TaskPayload::new("lonely")));
+        scheduler
+            .submit(Task::new(TaskPayload::new("lonely")))
+            .expect("submit should accept this task");
         let assignments = scheduler.schedule();
         assert!(
             assignments.is_empty(),
@@ -106,7 +110,9 @@ mod tests {
 
         let task = Task::new(TaskPayload::new("compute"));
         let task_id = task.id;
-        scheduler.submit(task);
+        scheduler
+            .submit(task)
+            .expect("submit should accept this task");
 
         let assignments = scheduler.schedule();
         assert_eq!(
@@ -125,7 +131,9 @@ mod tests {
             .worker_registered(WorkerInfo::new(WorkerId::new()))
             .unwrap();
 
-        scheduler.submit(Task::new(TaskPayload::new("once")));
+        scheduler
+            .submit(Task::new(TaskPayload::new("once")))
+            .expect("submit should accept this task");
 
         let first = scheduler.schedule();
         let second = scheduler.schedule();
@@ -145,7 +153,9 @@ mod tests {
 
         let task = Task::new(TaskPayload::new("job"));
         let task_id = task.id;
-        scheduler.submit(task);
+        scheduler
+            .submit(task)
+            .expect("submit should accept this task");
         scheduler.schedule();
 
         // Worker reports success.
@@ -156,7 +166,9 @@ mod tests {
         scheduler.worker_finished(result).unwrap();
 
         // After finishing, the worker should be eligible for a new assignment.
-        scheduler.submit(Task::new(TaskPayload::new("next-job")));
+        scheduler
+            .submit(Task::new(TaskPayload::new("next-job")))
+            .expect("submit should accept this task");
         let assignments = scheduler.schedule();
 
         assert_eq!(

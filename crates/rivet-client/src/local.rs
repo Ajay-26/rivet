@@ -18,12 +18,29 @@ pub struct LocalClient {
 }
 
 impl Client for LocalClient {
-    fn submit(&mut self, payload: TaskPayload) -> Result<TaskId, ClientError> {
-        let task = Task::new(payload);
+    /// TODO (Milestone 7, Step 6):
+    ///
+    /// The same three lines as `submit` above, with one change: build the task
+    /// with `Task::new(payload).with_dependencies(waits_for)` instead of
+    /// `Task::new(payload)`.
+    ///
+    /// The scheduler takes the list off the task and files it in `waiting_on`
+    /// and `blocks`, so nothing downstream of here needs to know about graphs.
+    ///
+    /// Once this works, delete `submit` above and let the trait default cover
+    /// it.
+    fn submit_with_dependencies(
+        &mut self,
+        _payload: TaskPayload,
+        _waits_for: Vec<TaskId>,
+    ) -> Result<TaskId, ClientError> {
+        let task = Task::new(_payload).with_dependencies(_waits_for);
         let runtime = self.runtime.lock();
         match runtime {
             Ok(mut runtime) => {
-                let id = runtime.scheduler.submit(task);
+                // `submit` can now fail — Milestone 7 rejects a dependency
+                // cycle here. `From<RivetError> for ClientError` makes `?` work.
+                let id = runtime.scheduler.submit(task)?;
                 Ok(id)
             }
             Err(_) => Err(ClientError::SubmitFailed(RivetError::Other(String::from(
@@ -109,5 +126,126 @@ mod tests {
         let _ = client.get_result(id);
         runtime.tick(); // deadlocks instead of failing if the guard leaked
         let _ = client.get_result(id);
+    }
+}
+
+// ── Milestone 7 tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod dependency_tests {
+    use super::*;
+    use crate::LocalRuntime;
+    use std::time::{Duration, Instant};
+
+    /// Tick until `id` has a result, or give up. Bounded on purpose: a cycle bug
+    /// and a starvation bug both look like "never finishes", and a failure
+    /// message is more use than a hung suite.
+    fn tick_until(runtime: &mut LocalRuntime, client: &LocalClient, id: TaskId) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            runtime.tick();
+            if client.get_result(id).unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn a_task_with_no_dependencies_still_works() {
+        let mut runtime = LocalRuntime::new(1, 1);
+        let mut client = runtime.client();
+        let id = client
+            .submit_with_dependencies(TaskPayload::new("lonely"), Vec::new())
+            .expect("an empty dependency list is always valid");
+
+        assert!(tick_until(&mut runtime, &client, id), "the task never ran");
+        assert!(client.get_result(id).unwrap().unwrap().is_success());
+    }
+
+    #[test]
+    fn a_dependent_task_waits_for_its_dependency() {
+        let mut runtime = LocalRuntime::new(2, 1);
+        let mut client = runtime.client();
+
+        let first = client.submit(TaskPayload::new("first")).unwrap();
+        let second = client
+            .submit_with_dependencies(TaskPayload::new("second"), vec![first])
+            .unwrap();
+
+        // One tick can only dispatch `first`, because `second` is blocked.
+        runtime.tick();
+        assert!(
+            client.get_result(second).unwrap().is_none(),
+            "second must not finish before first has even been dispatched"
+        );
+
+        assert!(
+            tick_until(&mut runtime, &client, second),
+            "second never ran"
+        );
+        assert!(
+            client.get_result(first).unwrap().unwrap().is_success(),
+            "first must have finished before second could start"
+        );
+    }
+
+    #[test]
+    fn the_runtime_completes_a_dependency_chain() {
+        let mut runtime = LocalRuntime::new(2, 2);
+        let mut client = runtime.client();
+
+        let a = client.submit(TaskPayload::new("a")).unwrap();
+        let b = client
+            .submit_with_dependencies(TaskPayload::new("b"), vec![a])
+            .unwrap();
+        let c = client
+            .submit_with_dependencies(TaskPayload::new("c"), vec![b])
+            .unwrap();
+
+        assert!(
+            tick_until(&mut runtime, &client, c),
+            "the chain never finished"
+        );
+        for id in [a, b, c] {
+            assert!(
+                client.get_result(id).unwrap().unwrap().is_success(),
+                "every task in the chain should succeed"
+            );
+        }
+    }
+
+    // No cycle test here, and that is worth knowing rather than fixing.
+    //
+    // `Client` never lets you name a task id before you submit it —
+    // `submit_with_dependencies` mints the id inside. So you can depend on an id
+    // you invented, but you can never make a later task *have* that id. A cycle
+    // is unreachable through this API.
+    //
+    // Cycles can only be built by code holding the scheduler directly, so
+    // `a_cycle_is_rejected_at_submit` belongs in
+    // `crates/rivet-scheduler/src/local.rs`.
+
+    #[test]
+    fn a_failed_dependency_gives_the_dependent_a_result() {
+        let mut runtime = LocalRuntime::new(1, 1);
+        let mut client = runtime.client();
+
+        // "panic" always fails, and the default max_retries gives up eventually.
+        let bad = client.submit(TaskPayload::new("panic")).unwrap();
+        let waiting = client
+            .submit_with_dependencies(TaskPayload::new("waiting"), vec![bad])
+            .unwrap();
+
+        assert!(
+            tick_until(&mut runtime, &client, waiting),
+            "the dependent never got a result. A dependency that fails for good \
+             must fail what it blocks, or the client waits for ever."
+        );
+        assert!(
+            !client.get_result(waiting).unwrap().unwrap().is_success(),
+            "a task whose dependency failed cannot have succeeded"
+        );
     }
 }

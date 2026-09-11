@@ -235,6 +235,40 @@ mod tests {
         );
     }
 
+    /// Milestone 7: the dependency graph belongs to the scheduler, and
+    /// `Task.depends_on` only carries it from the client to the scheduler.
+    /// `submit` takes the list off the task, so a task on the wire must have an
+    /// empty one. A worker has no use for a dependency list, and sending it
+    /// would be bytes on every dispatch for nothing.
+    #[test]
+    fn a_dispatched_task_carries_no_dependencies() {
+        let sent = Task::new(TaskPayload::new("dispatched"));
+        assert!(
+            sent.depends_on.is_empty(),
+            "Task::new must start with an empty list"
+        );
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &RuntimeToWorker::Run(sent)).unwrap();
+
+        let text = String::from_utf8(buf.clone()).unwrap();
+        assert!(
+            text.contains("\"depends_on\":[]"),
+            "the Run message should carry an empty dependency list, got {text}"
+        );
+
+        let got = read_message::<_, RuntimeToWorker>(&mut buf.as_slice())
+            .unwrap()
+            .unwrap();
+        match got {
+            RuntimeToWorker::Run(t) => assert!(
+                t.depends_on.is_empty(),
+                "the graph must not cross the socket"
+            ),
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
     #[test]
     fn read_message_returns_none_at_eof() {
         let mut empty = &b""[..];

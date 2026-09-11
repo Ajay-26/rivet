@@ -13,16 +13,11 @@ pub(crate) struct RuntimeInner {
     results_receiver: mpsc::Receiver<TaskResult>,
 }
 
+/// Owns the scheduler and the worker pool.
+///
+/// The pool holds `Box<dyn WorkerTransport>`, so in-process workers and worker
+/// processes sit in the same map and `tick` cannot tell them apart.
 #[derive(Debug)]
-// TODO (Milestone 6, Step 4): change the pool to hold either kind of worker.
-//
-//     workers: HashMap<WorkerId, Box<dyn WorkerTransport>>,
-//
-// `WorkerHandle` and `RemoteWorkerHandle` both implement `WorkerTransport`, so
-// one map can hold a mix. `LocalRuntime::new` boxes what `spawn` returns; the
-// dispatch half of `tick` needs no change at all, because it only ever calls
-// `send`. If you find yourself editing `tick`, the trait is in the wrong place.
-
 pub struct LocalRuntime {
     inner: Arc<Mutex<RuntimeInner>>,
 }
@@ -109,6 +104,36 @@ impl LocalRuntime {
         return Ok(LocalRuntime {
             inner: Arc::new(Mutex::new(inner)),
         });
+    }
+
+    /// Stop the workers and collect the last results.
+    ///
+    /// Safe to call more than once. `Drop` calls it for you, so most callers
+    /// never need to.
+    ///
+    /// The order matters. Clearing the pool runs each handle's own `Drop`: an
+    /// in-process handle closes its inbox and joins its threads, and a remote
+    /// handle shuts its socket and joins its reader. Both of those finish the
+    /// work already in flight and send the results. Only then is it worth
+    /// draining the channel, because only then is everything in it.
+    pub fn shutdown(&self) {
+        // A panic elsewhere must not stop shutdown, so take the lock back out of
+        // a poisoned mutex rather than giving up. Giving up here would leak
+        // worker processes.
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Dropping the handles blocks until in-flight work is done.
+        inner.workers.clear();
+
+        // Now every result that will ever arrive is already in the channel.
+        while let Ok(result) = inner.results_receiver.try_recv() {
+            if let Err(e) = inner.scheduler.worker_finished(result) {
+                eprintln!("rivet: result arrived for an unknown task: {e}");
+            }
+        }
     }
 
     pub fn client(&self) -> LocalClient {
@@ -254,6 +279,80 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_waits_for_work_already_in_flight() {
+        let mut runtime = LocalRuntime::new(1, 1);
+        let ids = submit_n(&runtime, 1);
+
+        runtime.tick(); // hand the task out
+        std::thread::sleep(Duration::from_millis(20)); // let the worker pick it up
+
+        let start = Instant::now();
+        runtime.shutdown();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "shutdown returned in {elapsed:?}, so it did not wait for the worker. \
+             Clearing the pool must join the threads, not detach them."
+        );
+        assert!(
+            runtime
+                .inner
+                .lock()
+                .unwrap()
+                .scheduler
+                .get_results()
+                .contains_key(&ids[0]),
+            "shutdown must drain the channel after joining, or the last result \
+             is thrown away"
+        );
+    }
+
+    #[test]
+    fn shutdown_can_be_called_twice() {
+        // `Drop` calls it too, so a caller who calls it by hand would otherwise
+        // shut down twice.
+        let runtime = LocalRuntime::new(2, 1);
+        runtime.shutdown();
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn dropping_the_runtime_shuts_the_pool_down() {
+        let mut runtime = LocalRuntime::new(1, 1);
+        submit_n(&runtime, 1);
+        runtime.tick();
+        std::thread::sleep(Duration::from_millis(20));
+
+        let start = Instant::now();
+        drop(runtime);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "drop returned in {elapsed:?}. LocalRuntime needs a Drop impl, or \
+             worker threads outlive the runtime that can no longer tick them."
+        );
+    }
+
+    #[test]
+    fn a_client_still_works_after_the_runtime_is_dropped() {
+        // Clients hold a clone of the same Arc, so the state survives. The
+        // workers do not, and that is on purpose: nothing can tick any more.
+        let mut runtime = LocalRuntime::new(1, 1);
+        let mut client = runtime.client();
+        let id = client.submit(TaskPayload::new("before")).unwrap();
+        assert_eq!(tick_until(&mut runtime, 1), 1);
+
+        drop(runtime);
+
+        assert!(
+            client.get_result(id).expect("no error").is_some(),
+            "a result recorded before shutdown must still be readable"
+        );
+    }
+
+    #[test]
     fn tick_on_an_idle_runtime_does_nothing() {
         let mut runtime = LocalRuntime::new(1, 1);
 
@@ -386,5 +485,18 @@ mod tests {
                 "task {id:?} never produced a result"
             );
         }
+    }
+}
+
+impl Drop for LocalRuntime {
+    /// Shut the pool down when the runtime handle goes away.
+    ///
+    /// Clients hold clones of the same `Arc`, so `RuntimeInner` can outlive
+    /// this handle. The workers should not. `tick` only exists on
+    /// `LocalRuntime`, so once this handle is gone nobody can drive the system
+    /// and no task will ever run again. Keeping worker threads and worker
+    /// processes alive past that point leaks them for nothing.
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }

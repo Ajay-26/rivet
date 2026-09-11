@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::vec::Vec;
 
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -98,6 +99,7 @@ pub struct Task {
     pub id: TaskId,
     pub payload: TaskPayload,
     pub status: TaskStatus,
+    pub depends_on: Vec<TaskId>,
 }
 
 impl Task {
@@ -106,7 +108,13 @@ impl Task {
             id: TaskId::new(),
             payload,
             status: TaskStatus::Pending,
+            depends_on: Vec::new(),
         }
+    }
+
+    pub fn with_dependencies(mut self, deps: Vec<TaskId>) -> Self {
+        self.depends_on = deps;
+        self
     }
 
     /// Returns `true` if this task has reached a terminal state (completed or failed).

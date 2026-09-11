@@ -21,7 +21,25 @@ use rivet_core::{TaskId, TaskPayload, TaskResult};
 /// ```
 pub trait Client {
     /// Submit a task for execution. Returns the task's ID.
-    fn submit(&mut self, payload: TaskPayload) -> Result<TaskId, ClientError>;
+    ///
+    /// Same as `submit_with_dependencies` with an empty list, so an
+    /// implementation only has to write the one method.
+    fn submit(&mut self, payload: TaskPayload) -> Result<TaskId, ClientError> {
+        self.submit_with_dependencies(payload, Vec::new())
+    }
+
+    /// Submit a task that must wait for other tasks to succeed first.
+    ///
+    /// Every id in `waits_for` must finish successfully before this task runs.
+    /// An id that is not submitted yet is allowed — a client may build a graph
+    /// in any order.
+    ///
+    /// Returns `Err` if the dependencies would close a cycle.
+    fn submit_with_dependencies(
+        &mut self,
+        payload: TaskPayload,
+        waits_for: Vec<TaskId>,
+    ) -> Result<TaskId, ClientError>;
 
     /// Check whether a task has finished.
     ///
