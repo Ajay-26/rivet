@@ -193,10 +193,12 @@ them over TCP.
 
 **Goal:** tasks can declare dependencies on other tasks.
 
-- Add `depends_on: Vec<TaskId>` to `Task`.
-- Split *eligibility* (the scheduler's job — it owns the results) from
-  *placement* (the policy's job). A `depends_on` check inside a policy has to be
-  written again in every other policy.
+- The graph lives in the **scheduler**, not on `Task` and not in a policy.
+  `Task.depends_on` only carries the list from client to scheduler, which then
+  takes ownership of it — a worker never sees a dependency.
+- Split *eligibility* (the scheduler's job — only it can see the results) from
+  *placement* (the policy's job). A policy cannot answer the graph question
+  anyway: `schedule` receives workers and pending tasks, never results.
 - `Scheduler::submit` returns `Result<TaskId, _>` so a cycle can be reported.
 - Detect cycles with a three-colour DFS — a plain visited set rejects diamonds.
 - Cascade a permanent failure to its dependents, or they block forever.

@@ -12,6 +12,8 @@ pub enum RivetError {
     WorkerNotFound(WorkerId),
     WorkerAlreadyRegistered(WorkerId),
     NoWorkersAvailable,
+    DependencyCycle(TaskId),
+    UnknownDependency { task: TaskId, dependency: TaskId },
     // TODO: Add IO / network error variants once workers communicate remotely.
     Other(String),
 }
@@ -26,6 +28,10 @@ impl fmt::Display for RivetError {
             }
             RivetError::NoWorkersAvailable => write!(f, "no workers available"),
             RivetError::Other(msg) => write!(f, "{msg}"),
+            RivetError::DependencyCycle(t) => write!(f, "{t}"),
+            RivetError::UnknownDependency { task, dependency } => {
+                write!(f, "task: {task}, dependecy: {dependency}")
+            }
         }
     }
 }

@@ -1228,20 +1228,38 @@ pub struct Task {
     pub id: TaskId,
     pub payload: TaskPayload,
     pub status: TaskStatus,
+    /// Dependencies, as supplied by the client.
+    ///
+    /// Only meaningful in transit. `LocalScheduler::submit` moves this into its
+    /// own map and leaves the vec empty, so a task on the wire never carries a
+    /// dependency list — a worker has no use for one.
     pub depends_on: Vec<TaskId>,
 }
 ```
 
 `Task::new` sets it empty, so every existing call site keeps compiling. Add a
-builder next to the ones in `WorkerInfo`:
+builder next to the ones on `WorkerInfo`:
 
 ```rust
 pub fn with_dependencies(mut self, deps: Vec<TaskId>) -> Self
 ```
 
 Edges point from dependent to dependency, which is the direction you need when
-asking "can I run?". Building the reverse index — dependency to dependents — is
-Step 4's problem, and it is only an optimisation.
+asking "can I run?". Step 3 builds the reverse index.
+
+**Why the field is a courier and not storage.** The dependency graph is a
+scheduling concern and nothing else. A worker receives `Run(task)`, executes the
+payload, and reports a result; it never asks what the task was waiting for. And
+since Milestone 6 the task crosses a socket, so anything on `Task` is bytes on
+the wire.
+
+But the client has to *tell* the scheduler somehow, and `Task` is what travels
+from one to the other. So the field exists to carry the list one hop, and the
+scheduler takes ownership of it on arrival. `std::mem::take` is the tool.
+
+The alternative is a second parameter on `Scheduler::submit`. That is arguably
+cleaner and costs about a dozen call-site edits across the existing tests. Both
+are defensible; if you take that route, delete this field.
 
 ## Step 2 — `crates/rivet-scheduler/src/lib.rs`: `submit` has to be able to fail
 
@@ -1261,26 +1279,65 @@ DependencyCycle(TaskId),
 UnknownDependency { task: TaskId, dependency: TaskId },
 ```
 
-and their `Display` arms. `UnknownDependency` is the one that catches a typo'd
-id, which otherwise looks exactly like a task that is blocked forever.
+and their `Display` arms. Write those arms as sentences, not as bare ids — an
+error that renders as `7` tells the reader nothing about what went wrong.
+`UnknownDependency` is the variant that catches a typo'd id, which otherwise
+looks exactly like a task blocked forever.
 
-## Step 3 — `crates/rivet-scheduler/src/local.rs`: detect cycles at submit
+## Step 3 — `crates/rivet-scheduler/src/local.rs`: own the graph
 
-A client may name a dependency it has not submitted yet — it is building a graph
-and the order is its own business. So keep
+Two new fields, alongside `results` and `attempts`:
 
 ```rust
-tasks: HashMap<TaskId, Vec<TaskId>>,   // every id ever submitted -> its deps
+/// waiting_on[B] == [A]  — "B is waiting on A"
+waiting_on: HashMap<TaskId, Vec<TaskId>>,
+/// blocks[A] == [B]      — "A blocks B"
+blocks: HashMap<TaskId, Vec<TaskId>>,
 ```
 
-and on each `submit`, run a depth-first search from the new node. If you reach
-the new node again, that submission closed a cycle: reject it and do not insert.
-Because you only search from one node, this is O(V+E) per submit, not per graph.
+Two names that read as sentences, on purpose. The obvious pair is
+`dependencies` and `dependents`, which differ by two letters and mean opposite
+things — you will misread them at a glance, and a swapped index is a bug that
+looks like correct code.
+
+`submit` takes the list off the incoming task and files it in **both** maps.
+`task.depends_on` is the list of things this task waits for, so it goes into
+`waiting_on` as-is, under this task's own id:
+
+```rust
+let waits_for = std::mem::take(&mut task.depends_on);
+// this task waits for all of them
+self.waiting_on.insert(task.id, waits_for.clone());
+// and each of them blocks this task
+for dep in waits_for {
+    self.blocks.entry(dep).or_default().push(task.id);
+}
+```
+
+So `depends_on` goes into `waiting_on` unchanged, and the same edges go into
+`blocks` reversed. Note `mut task` in the signature — `mut` on a by-value
+parameter is a local detail, so the trait and every caller stay as they are.
+
+Note what this buys. Neither policy changes, `TaskAssignment` does not change,
+the worker does not change, and nothing about the wire format changes. The graph
+is entirely a scheduler concern, which is what it should have been all along.
+
+**Build both directions.** `waiting_on` answers "can this run?" in Step 4;
+`blocks` answers "who else is now doomed?" in Step 5. Finding the second answer
+from the first map alone would mean scanning every entry, and you need it on a
+failure path where you are already holding a lock.
+
+**Cycle detection, at submit.** A client may name a dependency it has not
+submitted yet — it is building a graph and the order is its own business. So on
+each `submit`, depth-first search from the new node. If you reach the new node
+again, that submission closed a cycle: reject it and store nothing.
 
 Three colours, not a visited set: **white** unvisited, **grey** on the current
 stack, **black** finished. Reaching grey is a cycle; reaching black is a
 diamond, which is legal — look at `D` in the picture above. A plain `HashSet`
 cannot tell those apart and will reject valid graphs.
+
+Because you search from one node, this is O(V+E) per submit, not per graph.
 
 An unresolved dependency is not an error yet, only an id you have not seen.
 Check `UnknownDependency` when the task is *considered for dispatch*, not at
@@ -1298,68 +1355,101 @@ client the freedom to submit in any order. Say in a comment which one you chose.
 gate in between:
 
 1. Drain `pending` into two queues, asking of each task: is every id in
-   `depends_on` present in `self.results` **with a successful result**?
+   `self.waiting_on[&task.id]` present in `self.results` **with a successful result**?
 2. Give the policy only the eligible queue.
 3. Push the ineligible ones, plus whatever the policy did not place, back onto
    `pending`.
+
+**Keep this out of the policies.** A `SchedulerPolicy` receives `workers` and
+`pending_tasks` and nothing else — it cannot see `results`, so it *cannot* answer
+the eligibility question without a trait change and its own duplicate copy of
+completion state. And eligibility and placement are independent: put the graph
+check inside `FirstAvailablePolicy` and you have to write it again in
+`LeastLoadedPolicy`, and every future policy inherits the bug. The scheduler
+decides *whether*; the policy decides *where*.
 
 Watch the ordering in step 3. If blocked tasks always go to the front, a
 long-blocked task at the head can keep starving newly eligible ones behind it;
 if they always go to the back, a task's position drifts every tick. Preserving
 submission order is the least surprising choice — say which you picked.
 
-This is O(pending × deps) per tick. Fine at this scale. The index that removes
-it is `dependents: HashMap<TaskId, Vec<TaskId>>` plus a per-task
-`remaining_deps` counter, decremented as each dependency succeeds — Kahn's
-algorithm, incrementally. Note it; do not build it yet.
+This is O(pending × edges) per tick. Fine at this scale. The version that removes
+it keeps a `remaining_deps` counter per task, decremented as each dependency
+succeeds, so a task becomes eligible in O(1) — Kahn's algorithm, incrementally.
+Note it; do not build it yet.
 
 ## Step 5 — `crates/rivet-scheduler/src/local.rs`: cascade a permanent failure
 
 In `worker_finished`, the branch that gives up after `max_retries` is where the
-graph has to be told. A task whose dependency failed for good must be failed
-too, with a result the client can actually read:
+graph has to be told. A task whose dependency failed for good can never become
+eligible, so if you only gate on success it sits in `pending` forever while the
+client polls a result that will never arrive.
+
+Fail it too, with a result the client can actually read:
 
 ```rust
 TaskResult::Failure { task_id, error: format!("dependency {dep} failed") }
 ```
 
-Do it transitively — the dependents of the dependents fail as well — and remove
-each cascaded task from `pending` as you go. A worklist over
-`dependents` is the natural shape here, which is the first place Step 4's
-reverse index actually earns its keep.
+Do it transitively — whatever those tasks block fails as well — and remove each
+cascaded task from `pending` as you go. A worklist over `blocks` is the natural
+shape, and this is where Step 3's reverse index earns its keep.
 
 Retries are the case to be careful about: a dependency with attempts left has
 *not* failed permanently, so nothing cascades. Only the final give-up does.
+
+## Step 6 — `crates/rivet-client/`: let a client say what it depends on
+
+`Client::submit` takes a `TaskPayload` and builds the `Task` internally, so
+there is currently no way to express a dependency from outside. Add one method
+to the trait in `crates/rivet-client/src/lib.rs`:
+
+```rust
+fn submit_with_dependencies(
+    &mut self,
+    payload: TaskPayload,
+    waits_for: Vec<TaskId>,
+) -> Result<TaskId, ClientError>;
+```
+
+`LocalClient` builds `Task::new(payload).with_dependencies(waits_for)` and forwards
+it. Give `submit` a default body that calls this with an empty vec, so the
+existing implementation and every existing caller stay as they are.
 
 ### Tests
 
 | Test | File | Asserts |
 |---|---|---|
-| `a_task_with_no_dependencies_is_unaffected` | `rivet-scheduler/src/local.rs` | the whole M1–M5 suite still holds; `depends_on` empty means dispatch immediately |
+| `a_task_with_no_dependencies_is_unaffected` | `rivet-scheduler/src/local.rs` | the whole M1–M6 suite still holds; an empty `depends_on` means dispatch immediately |
+| `submit_takes_the_dependency_list_off_the_task` | `rivet-scheduler/src/local.rs` | after submit, the stored task's `depends_on` is empty and the scheduler's map has the edges. Pins the courier invariant, so nobody later "fixes" it by leaving the list on the task |
 | `a_blocked_task_is_not_dispatched` | `rivet-scheduler/src/local.rs` | B depends on A; with A unfinished, `schedule` returns A only |
 | `a_task_runs_once_its_dependency_succeeds` | `rivet-scheduler/src/local.rs` | complete A, then B dispatches on the next `schedule` |
 | `a_diamond_runs_in_topological_order` | `rivet-scheduler/src/local.rs` | A → {B, C} → D; D dispatches only after both B and C succeed, and the diamond is *not* mistaken for a cycle |
+| `both_policies_respect_dependencies` | `rivet-scheduler/src/local.rs` | run the blocked-task case under `FirstAvailablePolicy` and `LeastLoadedPolicy`. Fails if the gate ended up inside a policy |
 | `a_dependency_still_retrying_keeps_the_dependent_blocked` | `rivet-scheduler/src/local.rs` | A fails with attempts left; B is neither dispatched nor failed |
-| `a_permanently_failed_dependency_fails_its_dependents` | `rivet-scheduler/src/local.rs` | A exhausts `max_retries`; B gets a `Failure` result and leaves `pending` |
+| `a_permanently_failed_dependency_fails_what_it_blocks` | `rivet-scheduler/src/local.rs` | A exhausts `max_retries`; B gets a `Failure` result and leaves `pending` |
 | `a_failure_cascades_through_a_chain` | `rivet-scheduler/src/local.rs` | A ← B ← C; A fails for good, both B and C get results |
 | `a_self_dependency_is_rejected` | `rivet-scheduler/src/local.rs` | a task depending on itself is `Err(DependencyCycle)` |
 | `a_cycle_is_rejected_at_submit` | `rivet-scheduler/src/local.rs` | A→B→C→A: the third submit errors and the task is not stored |
 | `a_diamond_is_accepted` | `rivet-scheduler/src/local.rs` | the false positive a `HashSet` gives you instead of three colours |
 | `an_unknown_dependency_is_reported` | `rivet-scheduler/src/local.rs` | depending on an id never submitted surfaces `UnknownDependency` rather than blocking forever |
-| `the_runtime_completes_a_dependency_chain` | `rivet-client/src/runtime.rs` | end to end: A → B → C through real workers, tick until done, all three succeed and C's result arrives last |
+| `a_dispatched_task_carries_no_dependencies` | `rivet-worker/src/remote.rs` | the `Run` message on the wire has an empty `depends_on`. The graph must not cross the socket |
+| `the_runtime_completes_a_dependency_chain` | `rivet-client/src/runtime.rs` | end to end: A → B → C through real workers, tick until done, all three succeed |
 
 The last one is the only test that proves the whole path works. Bound its tick
-loop — a cycle bug or a starvation bug both present as "never terminates", and
+loop — a cycle bug and a starvation bug both present as "never terminates", and
 you want a failure message, not a hung suite.
 
 ### Questions to answer
 
 1. What algorithm did you use for cycle detection, and what is its complexity
    in tasks and edges? Why is a two-state visited set not enough?
-2. A dependency fails. Should the scheduler cancel the dependents, retry the
+2. A dependency fails. Should the scheduler cancel the tasks it blocks, retry the
    dependency, or propagate the failure? What did you choose, and what would a
    CI system choose?
-3. `depends_on` gives you a DAG per submission batch, but nothing stops two
+3. The graph lives in the scheduler, not on the task and not in a policy. Name
+   one thing that becomes harder because of that choice.
+4. `depends_on` gives you a DAG per submission batch, but nothing stops two
    clients submitting into the same graph. What breaks first?
 
 ---
